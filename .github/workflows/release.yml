@@ -21,6 +21,10 @@ on:
         description: Version to release, without the v prefix
         required: true
         type: string
+      build:
+        description: Build number (defaults to the workflow run number)
+        required: false
+        type: string
 
 concurrency:
   group: release
@@ -54,12 +58,20 @@ jobs:
           fi
           echo "version=$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Build the helpers and the payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/build-helpers.sh
+          ( cd wmship && ./build.sh )
+
       - name: Build unsigned app + zip the release artifact
         shell: bash
         run: |
           set -euo pipefail
-          cd work
-          SIGN_IDENTITY=- ./pack/package.sh "${{ steps.version.outputs.version }}" 35
+          BUILD="${{ inputs.build }}"
+          [[ -n "$BUILD" ]] || BUILD="${{ github.run_number }}"
+          SIGN_IDENTITY=- ./pack/package.sh "${{ steps.version.outputs.version }}" "$BUILD"
           # the same artifact name the cask downloads
           ditto -c -k --keepParent art/Sturgeon.app "$RUNNER_TEMP/sturgeon-${{ steps.version.outputs.version }}-macos-arm64.zip"
 
@@ -124,18 +136,13 @@ jobs:
           set -euo pipefail
           app="$RUNNER_TEMP/package/Sturgeon.app"
           tree="$app/Contents/Resources/wmship"
-          entitlements="work/pack/wmx.entitlements"          # com.apple.security.cs.debugger
           sign=(--force --sign "$SIGN_IDENTITY" --options runtime --timestamp)
 
-          # The three binaries that call task_for_pid(WindowManager) as root need the task-port
-          # entitlement under hardened runtime.  This is the only reason any helper has an
-          # entitlements file; the app shell and the observers get none.
-          for b in "$tree/bin/wmx" "$tree/wmship/wmhb" "$tree/wmship/wmcls"; do
-            codesign "${sign[@]}" --entitlements "$entitlements" "$b"
-            codesign -d --entitlements - "$b" | grep -q com.apple.security.cs.debugger
-          done
-
-          for b in "$tree"/bin/r19ax "$tree"/bin/r8state "$tree"/bin/r21probe \
+          # No entitlements: with SIP off, root already has task_for_pid against WindowManager, and
+          # the release build was verified without one.  Adding com.apple.security.cs.debugger would
+          # buy nothing and narrow what the notary service accepts.
+          for b in "$tree"/bin/wmx "$tree"/wmship/wmhb "$tree"/wmship/wmcls \
+                   "$tree"/bin/r19ax "$tree"/bin/r8state "$tree"/bin/r21probe \
                    "$tree"/bin/r21move "$tree"/bin/r21scroll "$tree"/bin/r21gesture \
                    "$tree"/bin/r21obs "$tree"/bin/r20click "$tree"/a/stagepilot \
                    "$tree"/wm/wmobs "$tree"/wm/wmkey \
