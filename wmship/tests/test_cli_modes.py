@@ -266,51 +266,112 @@ class BodyImage(unittest.TestCase):
         self.assertIn("changed since the install", det)
 
 
+class FakeStrip:
+    """A strip whose drawn geometry models the thing that made this issue subtle.
+
+    At rest (`s == 1.0`) the WindowManager draws its own resting pose, so the drawn width is the
+    natural width *no matter how wrong the taught base is* -- there is no write for the keeper to
+    correct. Under `dilate` the keeper writes `mat_scale(base, s)`, so a base taught `base_lift`
+    too large is visible as `s x base_lift`. `base_lift` is 1.0 for a healthy install and 1.05 for
+    a base baked from a hover lift (round 34 measured 1.505-1.746 at s=1.5)."""
+
+    def __init__(self, widths, base_lift=1.0, s=1.0, tiles=3):
+        self.nat = {str(1000 + i): w for i, w in enumerate(widths)}
+        self.base_lift = base_lift
+        self.s = s
+        self.dilate = abs(s - 1.0) > 1e-9
+        self.tiles = tiles
+        self.applied = []
+
+    def measure(self):
+        return [{"id": int(k), "owner": "Finder",
+                 "w": int(round(w * self.s * (self.base_lift if self.dilate else 1.0)))}
+                for k, w in sorted(self.nat.items())[:self.tiles]]
+
+    def apply(self, **kw):
+        self.applied.append(dict(kw))
+        self.s = float(kw["s"])
+        self.dilate = bool(kw.get("dilate"))
+
+    def sweep(self):
+        self.sweeps = getattr(self, "sweeps", 0) + 1
+
+    def settle(self, secs=0.0):
+        pass
+
+    def run(self, **kw):
+        return C.selfcheck(measure=self.measure, nat=dict(self.nat), s=kw.pop("s", self.s),
+                           apply=self.apply, sweep=self.sweep, settle=self.settle, **kw)
+
+
 class Selfcheck(unittest.TestCase):
-    """#5: the preflight over a fake measurement -- pass, fail, and no tiles."""
+    """#5: the preflight probes under dilate, because at rest a wrong base is invisible."""
 
-    def tiles(self, widths):
-        return [{"id": 100 + i, "owner": "Finder", "w": w} for i, w in enumerate(widths)]
-
-    def test_ratios_at_one_pass(self):
-        nat = {"100": 140, "101": 126}
-        r = C.selfcheck(self.tiles([140, 126]), nat, 1.0)
+    def test_a_healthy_strip_passes_and_is_left_at_rest(self):
+        w = FakeStrip([140, 126, 133])
+        r = w.run(s=1.0)
         self.assertTrue(r["ok"], r)
-        self.assertEqual([t["ratio"] for t in r["tiles"]], [1.0, 1.0])
-        self.assertIsNone(r["err"])
+        self.assertTrue(all(abs(t["ratio"] - 1.2) <= 0.02 for t in r["tiles"]), r["tiles"])
+        # the probe was applied, then released, and the geometry came back
+        self.assertEqual(w.applied[0]["s"], C.PROBE_S)
+        self.assertTrue(w.applied[0]["dilate"])
+        self.assertEqual(w.applied[-1]["s"], 1.0)
+        self.assertFalse(w.applied[-1]["dilate"])
+        self.assertEqual(w.s, 1.0)
+        self.assertEqual([t["ratio"] for t in r["restored"]], [1.0, 1.0, 1.0])
 
-    def test_a_two_percent_tolerance_is_the_boundary(self):
-        nat = {"100": 100}
-        self.assertTrue(C.selfcheck(self.tiles([102]), nat, 1.0)["ok"])
-        off = C.selfcheck(self.tiles([103]), nat, 1.0)
-        self.assertFalse(off["ok"])
-        self.assertEqual(off["tiles"][0]["ratio"], 1.03)
-
-    def test_one_bad_tile_fails_with_a_one_line_reason(self):
-        nat = {"100": 140, "101": 126, "102": 133}
-        r = C.selfcheck(self.tiles([140, 133, 133]), nat, 1.0)   # 101 is 5.5% wide
+    def test_a_base_taught_five_percent_large_fails_the_probe(self):
+        """The blocker: at rest this base reads 1.000 and used to pass."""
+        w = FakeStrip([140, 126, 133], base_lift=1.05)
+        self.assertEqual([t["w"] for t in w.measure()], [140, 126, 133])   # invisible at rest
+        r = w.run(s=1.0)
         self.assertFalse(r["ok"])
-        self.assertIn("tile 101", r["err"])
-        self.assertIn("1.056", r["err"])
+        self.assertAlmostEqual(r["tiles"][0]["ratio"], 1.26, delta=0.01)   # 1.2 x 1.05
+        self.assertIn("at probe 1.20", r["err"])
+        self.assertRegex(r["err"], r"tile 100[0-9]")
         self.assertNotIn("\n", r["err"])
 
-    def test_a_scaled_strip_is_checked_against_the_scale_applied(self):
-        nat = {"100": 100, "101": 100}
-        ok = C.selfcheck(self.tiles([150, 150]), nat, 1.5)
-        self.assertTrue(ok["ok"], ok)
-        # the same geometry would be a failure if the strip claimed to be at 1.0
-        self.assertFalse(C.selfcheck(self.tiles([150, 150]), nat, 1.0)["ok"])
+    def test_a_bad_probe_still_restores_the_scale(self):
+        w = FakeStrip([140, 126, 133], base_lift=1.05)
+        self.assertFalse(w.run(s=1.0)["ok"])
+        self.assertEqual(w.applied[-1]["s"], 1.0)
+        self.assertEqual(w.applied[-1]["dilate"], False)
+        self.assertEqual(w.s, 1.0)
+
+    def test_the_caller_scale_is_restored_not_forced_to_one(self):
+        w = FakeStrip([140, 140], s=1.4)
+        r = w.run(s=1.4)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(w.applied[-1]["s"], 1.4)
+        self.assertTrue(w.applied[-1]["dilate"])
+        self.assertEqual([t["ratio"] for t in r["restored"]], [1.4, 1.4])
+
+    def test_the_probe_never_teaches(self):
+        w = FakeStrip([140, 140])
+        w.run(s=1.0)
+        probe = w.applied[0]
+        self.assertIs(probe["teach"], False)
+        # teaching is re-enabled only when the strip is handed back
+        self.assertIs(w.applied[-1]["teach"], True)
+        self.assertTrue(all(a["teach"] is False for a in w.applied[:-1]))
+
+    def test_a_two_percent_tolerance_is_the_boundary(self):
+        self.assertTrue(FakeStrip([100], base_lift=1.02).run(s=1.0)["ok"])
+        self.assertFalse(FakeStrip([100], base_lift=1.03).run(s=1.0)["ok"])
 
     def test_no_tiles_is_a_refusal_not_a_pass(self):
-        r = C.selfcheck([], {}, 1.0)
+        w = FakeStrip([140], tiles=0)
+        r = w.run(s=1.0)
         self.assertFalse(r["ok"])
         self.assertIn("no strip tiles", r["err"])
-        self.assertEqual(r["tiles"], [])
+        self.assertEqual(w.applied, [])            # nothing was touched
 
     def test_a_tile_without_a_natural_width_says_how_to_fix_it(self):
-        r = C.selfcheck(self.tiles([140, 126]), {"100": 140}, 1.0)
+        r = C.selfcheck(measure=lambda: [{"id": 1, "w": 140}, {"id": 77, "w": 120}],
+                        nat={"1": 140}, s=1.0,
+                        apply=lambda **kw: None, sweep=lambda: None, settle=lambda: None)
         self.assertFalse(r["ok"])
-        self.assertIn("101", r["err"])
+        self.assertIn("77", r["err"])
         self.assertIn("wmship.sh teach", r["err"])
 
 

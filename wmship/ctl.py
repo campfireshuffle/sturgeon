@@ -38,6 +38,7 @@ TEACH_SETTLE = 1.2
 FAST_TRIES = 2           # bases present and fresh: apply, then re-sweep only if a tile missed
 SLOW_TRIES = 4           # the old budget, kept for the path that just re-learned the layout
 SELFCHECK_TOL = 0.02     # issue #5: a tile more than 2% off the expected scale is a refusal
+PROBE_S = 1.2            # the scale selfcheck applies to make a wrong base visible
 
 
 def wmctl():
@@ -259,44 +260,92 @@ def apply_scale(s, tries=None, teach=False):
 
 
 # ---------------------------------------------------------------- selfcheck (issue #5)
-def selfcheck(tiles=None, nat=None, s=None, tol=SELFCHECK_TOL):
-    """The resize preflight: is every tile where a working teach gate says it should be?
+def selfcheck(measure=None, nat=None, s=None, tol=SELFCHECK_TOL, probe=PROBE_S,
+              apply=None, sweep=None, settle=None):
+    """The resize preflight: does every tile scale by the factor the keeper thinks it applied?
 
-    A tile's natural width is recorded at scale 1.0, so the drawn width must read `s x natural`
-    (`s` is the scale currently applied, 1.0 when none is).  This does not teach and does not
-    write the configuration at all: teaching here would hide exactly the quiet failure it is
-    meant to detect (a base baked from a hover lift, or a stale base after an OS update), and a
-    check that changes the scale could not be "exit with the strip where you found it".
-    Measurement is user-side (CGWindowList) only, so one pass costs milliseconds and no pointer
-    movement.  The measurement layer is a parameter so this is testable without a WindowManager."""
-    if tiles is None:
-        tiles = rail_tiles()
-    if nat is None:
-        nat = natural()
+    Measuring at rest is not a check.  At `s == 1.0` the keeper writes a base back to the screen
+    only when the WM's write is our own, and `apply_all()` runs only on a keeper call -- so a base
+    taught 5% too large from a hover lift is *invisible* while the strip is at rest: the WM draws
+    its own resting pose and `width / natural` reads 1.000 whether the base is right or not.  That
+    is exactly the state in which the app offers the slider, so a rest measurement would pass every
+    broken install and the first scale would land ~5% off.
+
+    So the probe is: apply a known scale with teaching off, let the keeper compose
+    `mat_scale(base, probe)` onto the tiles, and demand the drawn width back as `probe x natural`
+    within `tol`.  A base that is wrong by 5% reads `probe x 1.05` and fails.  Then the caller's
+    scale is restored and the geometry is measured again, so the check cannot leave the strip
+    somewhere it was not (and cannot leave a scale applied).
+
+    `apply_all()` is called from `keeper_body` only (wmship/payload.c), i.e. only when the WM emits
+    a pose write; a cfg generation change on its own does not repaint.  Each phase therefore needs
+    one write-triggering sweep, which is one pointer pass over the tiles and the same cost as a
+    resize measurement sweep.  Teaching stays off for the whole probe.
+
+    `measure`, `apply` and `settle` are the seam: tests drive a fake strip through them, so the
+    whole decision (including the doctored-base case) is exercised without a WindowManager."""
+    measure = measure or rail_tiles
+    apply = apply or (lambda **kw: cfg_set(**kw))
+    sweep = sweep or (lambda: wmctl().force_writes(passes=1))
+    settle = settle or (lambda secs=0.35: time.sleep(secs))
+
+    def rows(want):
+        out = []
+        for t in measure():
+            n = nat.get(str(t["id"]))
+            out.append({"id": t["id"], "owner": t.get("owner"), "w": t["w"], "natural": n,
+                        "ratio": round(t["w"] / n, 3) if n else None, "want": want})
+        return out
+
+    def off(rs, want):
+        return [r for r in rs if r["ratio"] is None or abs(r["ratio"] - want) > tol + 1e-9]
+
+    t0 = time.time()
     if s is None:
         c = cfg_get()
         s = float(c.get("s", 1.0)) if c.get("dilate") else 1.0
     s = round(float(s), 3)
-    rows = []
-    for t in tiles:
-        n = nat.get(str(t["id"]))
-        rows.append({"id": t["id"], "owner": t.get("owner"), "w": t["w"], "natural": n,
-                     "ratio": round(t["w"] / n, 3) if n else None})
-    rep = {"ok": False, "s": s, "tol": tol, "tiles": rows, "err": None}
-    if not rows:
+    if nat is None:
+        nat = natural()
+    rep = {"ok": False, "s": s, "probe_s": probe, "tol": tol, "tiles": [],
+           "restored": [], "err": None}
+    first = measure()
+    if not first:
         rep["err"] = "no strip tiles on screen (reveal the strip first)"
         return rep
-    missing = [r["id"] for r in rows if not r["natural"]]
+    missing = [t["id"] for t in first if not nat.get(str(t["id"]))]
     if missing:
         rep["err"] = ("no natural width on record for tile(s) %s — run: wmship.sh teach"
                       % ", ".join(str(x) for x in missing))
         return rep
-    bad = [r for r in rows if abs(r["ratio"] - s) > tol + 1e-9]
-    rep["ok"] = not bad
-    if bad:
-        worst = max(bad, key=lambda r: abs(r["ratio"] - s))
-        rep["err"] = ("tile %d measures %.3f x natural, want %.3f ± %.2f (%d of %d tiles off)"
-                      % (worst["id"], worst["ratio"], s, tol, len(bad), len(rows)))
+
+    err = None
+    try:
+        apply(s=probe, dilate=True, teach=False)
+        sweep()
+        settle()
+        rep["tiles"] = rows(probe)
+        bad = off(rep["tiles"], probe)
+        if bad:
+            worst = max(bad, key=lambda r: abs((r["ratio"] or 0) - probe))
+            err = ("tile %s measures %s x natural at probe %.2f, want %.2f ± %.2f (%d of %d off)"
+                   % (worst["id"],
+                      "%.3f" % worst["ratio"] if worst["ratio"] is not None else "unknown",
+                      probe, probe, tol, len(bad), len(rep["tiles"])))
+    finally:
+        # whatever happened, put the strip back where it was found
+        apply(s=s, dilate=abs(s - 1.0) > 1e-9, teach=True)
+        sweep()
+        settle()
+        rep["restored"] = rows(s)
+        if err is None:
+            rbad = off(rep["restored"], s)
+            if rbad:
+                err = ("strip did not return to %.3f: tile %s reads %s"
+                       % (s, rbad[0]["id"], rbad[0]["ratio"]))
+    rep["ok"] = err is None
+    rep["err"] = err
+    rep["secs"] = round(time.time() - t0, 2)
     return rep
 
 
@@ -413,7 +462,10 @@ if __name__ == "__main__":
     elif cmd == "teach":
         r = teach_now()
         cfg_set(teach=True)              # leave the payload able to learn the next layout
-        print(json.dumps(r, indent=1)); sys.exit(0 if r["ok"] else 1)
+        r["s"] = 1.0                     # teaching is only allowed at 1.0, so it released any scale
+        print(json.dumps(r, indent=1))
+        print("teach: strip left at scale 1.0 — re-apply a scale with `wmship.sh resize <s>`")
+        sys.exit(0 if r["ok"] else 1)
     elif cmd == "selfcheck":
         r = selfcheck()
         print(json.dumps(r, indent=1))
