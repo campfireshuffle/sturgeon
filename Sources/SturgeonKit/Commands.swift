@@ -77,8 +77,9 @@ public struct Toolchain {
             return try root("/usr/bin/python3 \(Paths.quote(paths.installPy.path)) status --json",
                             timeout: command.timeout)
         case .counters:
-            return try root("/usr/bin/python3 \(Paths.quote(paths.installPy.path)) counters",
-                            timeout: command.timeout)
+            // A verb, not the legacy `-c` passthrough: after #24 the helper refuses any command
+            // shape it does not name, and `install.py counters` was never one of the three.
+            return try verb(["counters"], timeout: command.timeout)
         case .configWrite(let json):
             return try root("/usr/bin/python3 \(Paths.quote(paths.installPy.path)) cfg \(Paths.quote(json))",
                             timeout: command.timeout)
@@ -106,8 +107,19 @@ public struct Toolchain {
         }
     }
 
-    /// The ONLY root path: `sudo -n <tree>/asroot -c '<command>'`. The sudoers rule names that
-    /// exact passthrough, so no other command shape can run privileged.
+    /// The ONLY root path: `sudo -n <tree>/asroot <verb>`. The sudoers rule names that exact
+    /// passthrough, and the helper parses the verb itself; no shell is involved.
+    private func verb(_ arguments: [String], timeout: TimeInterval) throws -> Invocation {
+        guard let asroot = paths.asroot else {
+            throw Failure.bundleIncomplete("asroot missing")
+        }
+        return Invocation(executable: URL(fileURLWithPath: "/usr/bin/sudo"),
+                          arguments: ["-n", asroot.path] + arguments,
+                          timeout: timeout)
+    }
+
+    /// The three legacy shapes the helper still accepts for the app's older callers:
+    /// `sudo -n <tree>/asroot -c '<fixed command>'`. New commands use `verb` instead.
     private func root(_ command: String, timeout: TimeInterval) throws -> Invocation {
         guard let asroot = paths.asroot else {
             throw Failure.bundleIncomplete("asroot missing")

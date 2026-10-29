@@ -296,6 +296,13 @@ struct ContentView: View {
                                             })) {
             VStack(alignment: .leading, spacing: 7) {
                 counterGrid
+                if let note = model.countersNote {
+                    Text(note)
+                        .font(.system(size: 9))
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("countersNote")
+                }
                 if let resize = model.lastResize {
                     resizeTable(resize)
                 } else {
@@ -304,16 +311,17 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
 
-                Toggle(isOn: Binding(get: { model.trace }, set: { model.setTrace($0) })) {
+                Toggle(isOn: .constant(false)) {
                     Text("Pose trace").font(.system(size: 11, weight: .semibold))
                 }
                 .toggleStyle(.checkbox)
-                .disabled(!model.armed || model.busy)
+                .disabled(true)
                 .accessibilityIdentifier("traceToggle")
-                Text("Advanced. Publishes every keeper decision (m0, base, retract/departure/lift) "
-                     + "into the payload log. Leave it off for normal use: the log ring is small, and "
-                     + "a resize sweep moves your pointer across every tile for a minute or two — "
-                     + "do not run one while sharing your screen.")
+                Text(PoseTrace.unavailableNote + " The payload half is issue #31: until it lands, "
+                     + "this control is deliberately inert rather than writing a key nothing reads. "
+                     + "Advanced when it does land: it publishes every keeper decision (m0, base, "
+                     + "retract/departure/lift), and a resize sweep moves your pointer across every "
+                     + "tile for a minute or two — do not run one while sharing your screen.")
                     .font(.system(size: 9))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

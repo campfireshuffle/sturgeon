@@ -1,5 +1,17 @@
 import Foundation
 
+/// The pose trace is the payload's own per-decision log (`m0`, the base value, and the
+/// retract/departure/lift verdicts).  `wmship/payload.c` on this build parses no trace key at all
+/// (issue #31), so the control is present but gated off: the UI must not promise output that
+/// cannot appear.
+public enum PoseTrace {
+    public static let isAvailable = false
+    public static let issue = 31
+    public static let unavailableNote = "Not available in this payload build (see #31)."
+
+    public static func canEnable(armed: Bool) -> Bool { isAvailable && armed }
+}
+
 /// One paste-ready diagnostics block.  Everything the panel shows is assembled here from already
 /// decoded reports, so the formatting is testable without a WindowManager, a payload or a popover.
 ///
@@ -16,9 +28,11 @@ public struct DiagnosticsSnapshot: Equatable {
     public var status: StatusReport?
     public var doctor: DoctorReport?
     public var counters: CountersReport?
+    /// Why the full counter set could not be read (a helper without the `counters` verb, for
+    /// example).  Shown instead of silently falling back to the five fields in `status`.
+    public var countersNote: String?
     public var resize: ResizeReport?
     public var lastError: String?
-    public var trace: Bool
     public var gesture: String
     public var ambiguousDrops: Int
     public var inputRearms: Int
@@ -31,9 +45,9 @@ public struct DiagnosticsSnapshot: Equatable {
                 status: StatusReport? = nil,
                 doctor: DoctorReport? = nil,
                 counters: CountersReport? = nil,
+                countersNote: String? = nil,
                 resize: ResizeReport? = nil,
                 lastError: String? = nil,
-                trace: Bool = false,
                 gesture: String = "off",
                 ambiguousDrops: Int = 0,
                 inputRearms: Int = 0,
@@ -44,9 +58,9 @@ public struct DiagnosticsSnapshot: Equatable {
         self.status = status
         self.doctor = doctor
         self.counters = counters
+        self.countersNote = countersNote
         self.resize = resize
         self.lastError = lastError
-        self.trace = trace
         self.gesture = gesture
         self.ambiguousDrops = ambiguousDrops
         self.inputRearms = inputRearms
@@ -112,6 +126,9 @@ public struct DiagnosticsSnapshot: Equatable {
             "\(key)=\(counter(key).map(String.init) ?? "—")"
         }.joined(separator: " ")
         lines.append("counters \(countersLine)")
+        if let countersNote, !countersNote.isEmpty {
+            lines.append("counters-note \(countersNote)")
+        }
 
         if let resize {
             let scale = resize.scale.map { String(format: "%.3f", $0) } ?? "?"
@@ -132,7 +149,7 @@ public struct DiagnosticsSnapshot: Equatable {
         lines.append("ambiguous-drops \(ambiguousDrops)")
         lines.append("input-rearms \(inputRearms)")
         lines.append("gesture \(gesture)")
-        lines.append("trace \(trace ? "on (advanced)" : "off")")
+        lines.append("trace \(PoseTrace.isAvailable ? "available" : "unavailable (not in this payload build; #\(PoseTrace.issue))")")
 
         return Self.redact(lines.joined(separator: "\n"))
     }

@@ -128,26 +128,24 @@ final class DropTests: XCTestCase {
 
     // MARK: - the counters command
 
-    func testCountersCommandUsesTheSameRootPassthroughAsStatus() throws {
+    func testCountersUsesTheHelperVerbNotTheLegacyPassthrough() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("sturgeon-counters-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: root.appendingPathComponent("wmship"),
-                                                withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("bin"),
                                                 withIntermediateDirectories: true)
         let asroot = root.appendingPathComponent("bin/asroot")
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: asroot)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: asroot.path)
-        let install = root.appendingPathComponent("wmship/install.py")
-        try Data("#!/usr/bin/python3\n".utf8).write(to: install)
 
         let toolchain = Toolchain(paths: Paths(root: root, layout: .checkout,
                                                executable: root.appendingPathComponent("Sturgeon")))
         let call = try toolchain.invocation(for: .counters)
         XCTAssertEqual(call.executable.path, "/usr/bin/sudo")
-        XCTAssertEqual(call.arguments,
-                       ["-n", asroot.path, "-c",
-                        "/usr/bin/python3 \(Paths.quote(install.path)) counters"])
+        // The helper is a verb dispatcher after #24: the only accepted forms are a verb or the
+        // three named legacy shapes, and `install.py counters` was never one of the three.
+        XCTAssertEqual(call.arguments, ["-n", asroot.path, "counters"])
+        XCTAssertFalse(call.arguments.contains("-c"))
+        XCTAssertFalse(call.arguments.contains(where: { $0.contains("install.py") }))
         XCTAssertEqual(call.timeout, 40)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
     }

@@ -69,7 +69,6 @@ final class DiagnosticsTests: XCTestCase {
             counters: counters ? try XCTUnwrap(RunResult(out: countersJSON).decode(CountersReport.self)) : nil,
             resize: resize ? try XCTUnwrap(RunResult(out: resizeJSON).decode(ResizeReport.self)) : nil,
             lastError: "resize → no strip tiles",
-            trace: true,
             gesture: "listening (Control + Option)",
             ambiguousDrops: 2,
             inputRearms: 1)
@@ -125,7 +124,7 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(lines.contains("ambiguous-drops 2"))
         XCTAssertTrue(lines.contains("input-rearms 1"))
         XCTAssertTrue(lines.contains("gesture listening (Control + Option)"))
-        XCTAssertTrue(lines.contains("trace on (advanced)"))
+        XCTAssertTrue(lines.contains("trace unavailable (not in this payload build; #31)"))
         XCTAssertTrue(lines.contains(where: { $0.hasPrefix("doctor FAIL") }))
 
         // The doctor's refusal named a home directory; the block must not carry it.
@@ -194,10 +193,29 @@ final class DiagnosticsTests: XCTestCase {
 
     // MARK: - config
 
-    func testTraceIsOneConfigKey() throws {
-        let config = try XCTUnwrap(PayloadConfig(json: #"{"s":1.0,"trace":false}"#))
-        XCTAssertFalse(config.trace)
-        XCTAssertEqual(config.applying(.trace(true)).encoded(), #"{"s":1,"trace":true}"#)
-        XCTAssertEqual(ConfigChange.trace(true).label, "trace=true")
+    // MARK: - the pose trace (gated, not promised)
+
+    func testPoseTraceIsGatedOffInThisBuild() {
+        XCTAssertFalse(PoseTrace.isAvailable, "payload.c has no trace parsing on this build")
+        XCTAssertFalse(PoseTrace.canEnable(armed: true),
+                       "an armed app still cannot produce trace output")
+        XCTAssertFalse(PoseTrace.canEnable(armed: false))
+        XCTAssertTrue(PoseTrace.unavailableNote.contains("#31"))
+
+        // The block must not claim the trace is on or off: it says the feature is unavailable.
+        let block = DiagnosticsSnapshot().block()
+        XCTAssertTrue(block.contains("trace unavailable (not in this payload build; #31)"))
+        XCTAssertFalse(block.contains("trace on"))
+    }
+
+    func testCountersRefusalIsVisibleInsteadOfSilentDashes() throws {
+        let status = try XCTUnwrap(RunResult(out: statusJSON).decode(StatusReport.self))
+        let snap = DiagnosticsSnapshot(
+            status: status,
+            counters: nil,
+            countersNote: "counters unavailable: asroot: refused: unknown verb counters")
+        let block = snap.block()
+        XCTAssertTrue(block.contains("counters inject=12 miss=2 keep=— learn=— replay=— dil=—"))
+        XCTAssertTrue(block.contains("counters-note counters unavailable: asroot: refused: unknown verb counters"))
     }
 }

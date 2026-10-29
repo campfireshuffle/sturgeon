@@ -31,12 +31,12 @@ final class PilotModel: ObservableObject {
     @Published var onTop = false
     @Published var level3 = false
     @Published var scale: Double = 1.0
-    @Published var trace = false
 
     // diagnostics
     @Published var diagnosticsOpen = false
     @Published var lastResize: ResizeReport?
     @Published var fullCounters: CountersReport?
+    @Published var countersNote: String?
     @Published var lastError: String?
     @Published var ambiguousDrops = 0
     @Published var inputStatus = "off (disarmed)"
@@ -145,22 +145,35 @@ final class PilotModel: ObservableObject {
     }
 
     /// Diagnostics refresh on the popover's 2 s tick while the section is open.  The counters
-    /// command needs root, so it runs through the same asroot passthrough as status; the tick is
-    /// also where a tap that macOS disabled is noticed and re-armed.
+    /// command needs root, so it runs through the helper's `counters` verb; the tick is also
+    /// where a tap that macOS disabled is noticed and re-armed.
     func refreshDiagnostics() {
         guard armed else {
             fullCounters = nil
+            countersNote = nil
             inputRearms = inputTap.rearmCount
             inputStatus = inputTap.statusText
             return
         }
         inputTap.ensureEnabled()
         Backend.queue.async {
-            let counters = Backend.counters()
-            let config = Backend.config()
+            let result = Backend.run(.counters)
+            let counters = result.decode(CountersReport.self)
             DispatchQueue.main.async {
-                if let counters { self.fullCounters = counters }
-                if let config { self.trace = config.trace }
+                if let counters {
+                    self.fullCounters = counters
+                    self.countersNote = nil
+                } else {
+                    // Do not let the four keeper-only counters silently become dashes: say why.
+                    let text = result.combined
+                    let refusal = text.split(separator: "\n")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .first { $0.lowercased().contains("refused") }
+                    let why = refusal ?? Self.lastLine(text)
+                    self.countersNote = why.isEmpty
+                        ? "counters command failed (helper has no counters verb?)"
+                        : "counters unavailable: \(why)"
+                }
                 self.inputRearms = self.inputTap.rearmCount
                 self.inputStatus = self.inputTap.statusText
             }
@@ -317,11 +330,6 @@ final class PilotModel: ObservableObject {
         writeConfig(.level(v))
     }
 
-    func setTrace(_ v: Bool) {
-        trace = v
-        writeConfig(.trace(v))
-    }
-
     private func writeConfig(_ change: ConfigChange) {
         guard armed else {
             footer = "not armed — the payload config is not writable"
@@ -341,7 +349,6 @@ final class PilotModel: ObservableObject {
                 self.gestureConfig = nil
                 if written.code == 0 {
                     self.footer = "cfg \(change.label) → written; read-back \(after.brief)"
-                    self.trace = after.trace
                 } else {
                     self.footer = "cfg \(change.label) → error: \(Self.lastLine(written.combined))"
                     self.lastError = Self.lastLine(written.combined)
@@ -624,9 +631,9 @@ final class PilotModel: ObservableObject {
             status: lastStatus,
             doctor: doctorReport,
             counters: fullCounters,
+            countersNote: countersNote,
             resize: lastResize,
             lastError: lastError,
-            trace: trace,
             gesture: inputStatus,
             ambiguousDrops: ambiguousDrops,
             inputRearms: inputRearms,
