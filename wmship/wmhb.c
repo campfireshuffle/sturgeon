@@ -320,9 +320,12 @@ static int publish_wids(double t) {
 //   class WindowIDTable { let _lock; var _serial: UInt64; var _map: [UInt32: External];
 //                         let _externalRepresentations }
 // `_map` is keyed by the WindowID's own `serial` and its value starts with
-// { cgWindowID: UInt32, stageID: UInt32 } (measured: 0x28-byte values, keys and values as
-// separate arrays whose pointers sit in the dictionary header at +0x30/+0x38).  That is the
-// numeric WindowID -> CGWindowID association the payload needs, and it can be read here, out of
+// { cgWindowID: UInt32, ownerPID: UInt32, owner: String, title: String } (measured: 0x28-byte
+// values, keys and values as separate arrays whose pointers sit in the dictionary header at
+// +0x30/+0x38).  The second word is the owner *process*: five map entries were matched against
+// the observer's NEW lines on build 462.0.8.402 and every one carried that line's pid, not a
+// stage (see docs/RESEARCH-births.md, round 37 addendum).  That is the numeric
+// WindowID -> CGWindowID association the payload needs, and it can be read here, out of
 // process, where a bad read is a failed mach_vm_read instead of a WindowManager fault.
 static uint64_t g_tab;
 
