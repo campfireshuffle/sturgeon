@@ -691,6 +691,11 @@ def loop_span(m, fs, fe, site):
 
 
 # ---------------------------------------------------------------- SkyLight
+# The one canonical name table for the six patch sites.  Everything that keys sites by name --
+# this tool's output, install.py's patch bookkeeping, backup.json and the armed doctor -- uses
+# these names.  install.py imports this tuple instead of keeping a copy (issue #42).
+SITE_NAMES = ("birth", "birth2", "birthE", "compute", "keeper3d", "keeper2d")
+
 KEEPER_NAMES = [("keeper3d", "_SLSTransactionSetWindowTransform3D", 0x70),
                 ("keeper2d", "_SLSTransactionSetWindowTransform", 0x80)]
 
@@ -1070,8 +1075,7 @@ def main(argv):
                        if wm_cache == "hit-verified"
                        and result["images"].get("SkyLight", {}).get("cache") == "hit-verified"
                        else "miss")
-    need = ("birth", "birth2", "birthE", "compute", "keeper3d", "keeper2d")
-    missing = [k for k in need if k not in result["sites"]]
+    missing = [k for k in SITE_NAMES if k not in result["sites"]]
     result["ok"] = not missing
     result["missing"] = missing
     print(json.dumps(result, indent=1, sort_keys=True))
