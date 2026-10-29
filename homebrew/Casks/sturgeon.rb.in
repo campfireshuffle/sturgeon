@@ -32,16 +32,20 @@ cask "sturgeon" do
 
     Requirements: SIP disabled (`csrutil status`), macOS 26 or later, Xcode command line tools
     for /usr/bin/python3, and an admin account.  setup.sh writes one NOPASSWD rule for the
-    bundled bin/asroot and the com.stagemgr.wmshipd LaunchDaemon, both derived from this app's
-    own path; it is idempotent and refuses to grant any other copy.
+    bundled bin/asroot — a compiled helper that accepts a fixed verb list (doctor, status,
+    install, uninstall, arm, disarm, teardown, …) and refuses arbitrary argv, shells and stdin —
+    plus the com.stagemgr.wmshipd LaunchDaemon, both derived from this app's own path; it is
+    idempotent and refuses to grant any other copy.
 
-    `brew uninstall --cask sturgeon` boots the LaunchDaemon out and removes the sudoers rule;
-    `brew uninstall --zap --cask sturgeon` also removes ~/Library/Application Support/Sturgeon
-    and /tmp/wmship.  Quit the menu-bar app first (it is an LSUIElement app).
+    `brew uninstall --cask sturgeon` restores the WindowManager patch first, then boots the
+    LaunchDaemon out and removes the sudoers rule; `brew uninstall --zap --cask sturgeon` also
+    removes ~/Library/Application Support/Sturgeon and /tmp/wmship.  Quit the menu-bar app first
+    (it is an LSUIElement app).
   EOS
 
   # The privileged undo is one bundled script, deliberately: it must run as root, BEFORE the app is
   # deleted, and it uses the tool's own NOPASSWD helper so `brew uninstall` needs no password.
+  # It disarms the live patch before it removes the helper that can restore it (issue #21).
   uninstall script: {
               executable:   "#{appdir}/Sturgeon.app/Contents/Resources/wmship/teardown.sh",
               must_succeed: false,

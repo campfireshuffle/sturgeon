@@ -47,7 +47,9 @@ say "wmship:"
 clang "${CC_FLAGS[@]}" -o "$ROOT/wmship/wmhb" "$ROOT/wmship/wmhb.c"
 clang "${CC_FLAGS[@]}" -o "$ROOT/wmship/wmcls" "$ROOT/wmship/wmcls.c"
 
-# the privileged passthrough is a script, not a binary
-install -m 755 "$ROOT/helpers/asroot" "$ROOT/bin/asroot"
+# the privileged entry point: a compiled verb dispatcher, not a shell passthrough.  It derives the
+# tool tree from its own real path (bin/asroot -> the tree), so it must be installed at bin/asroot.
+say "  cc   asroot"
+clang "${CC_FLAGS[@]}" -o "$ROOT/bin/asroot" "$ROOT/helpers/asroot.c"
 
 say "built: $(ls "$ROOT/bin" | tr '\n' ' ')"

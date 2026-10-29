@@ -9,8 +9,9 @@
 #      The tool needs root for task_for_pid, the LaunchDaemon and the page remap.  A single
 #      NOPASSWD rule is used instead of prompting per operation because `wmship.sh start|stop`,
 #      `doctor` and the daemon must run unattended (the daemon is a launchd job with no terminal
-#      to prompt on).  No credential is stored: the rule grants one binary, and that binary is
-#      the bundled passthrough to /bin/zsh.
+#      to prompt on).  No credential is stored: the rule grants one *compiled* binary that accepts
+#      a fixed verb list (doctor/status/install/uninstall/arm/disarm/…) and refuses arbitrary
+#      argv.  It is not a shell: there is no `sh -c`, no stdin and no inherited environment.
 #   2. /Library/LaunchDaemons/com.stagemgr.wmshipd.plist
 #      ProgramArguments are filled in for this bundle (a shipped plist with a baked-in path would
 #      silently re-arm the wrong tree).  Installed, NOT started: `--load` starts it now, and
@@ -50,6 +51,11 @@ APP=$(cd $R/../../.. && pwd -P)          # <app>.app/Contents/Resources/wmship -
 [[ $APP == *.app ]] || die "the tool is not inside a .app bundle: $APP"
 GRANT=$APP/Contents/Resources/wmship/bin/asroot
 [ -x $GRANT ] || die "$GRANT is missing or not executable"
+# The rule grants a verb dispatcher, never a shell.  Refuse to grant a stale script copy (an
+# older bundle, or a tree where the helper was not rebuilt).
+"$GRANT" --verbs >/dev/null 2>&1 \
+  || die "$GRANT is not the verb-limited helper (rebuild with scripts/build-helpers.sh, or
+  reinstall the app)"
 # the identity check the brief asks for: what we would grant must be what we are running
 [ "$GRANT" = "$ASROOT" ] || die "refusing: the rule would grant
   $GRANT

@@ -1,3 +1,0 @@
-#!/bin/zsh
-# Executes the given script as root. This is the ONLY path granted NOPASSWD in sudoers.
-exec /bin/zsh "$@"

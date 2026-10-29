@@ -131,7 +131,7 @@ print -r -- "{\"version\":\"$VERSION\",\"build\":\"$BUILD\"}" > $APP/Contents/Re
 say "version.json: $(cat $APP/Contents/Resources/version.json)"
 
 # ---------------------------------------------------------------- 4. sign, inside out
-for b in $T/bin/wmx $T/wmship/wmhb $T/wmship/wmcls \
+for b in $T/bin/asroot $T/bin/wmx $T/wmship/wmhb $T/wmship/wmcls \
          $T/bin/r19ax $T/bin/r8state $T/bin/r21probe $T/bin/r21move $T/bin/r21scroll \
          $T/bin/r21gesture $T/bin/r21obs $T/bin/r20click $T/a/stagepilot \
          $T/wm/wmobs $T/wm/wmkey $APP/Contents/MacOS/$APPNAME; do

@@ -23,7 +23,8 @@
 # Sturgeon.app/Contents/Resources/wmship.  The only absolute paths left are the fixed system
 # locations: /tmp/wmship (runtime state) and /Library/LaunchDaemons (the daemon).
 #
-# Requirements: SIP off, root (setup.sh installs the NOPASSWD rule for the bundled asroot),
+# Requirements: SIP off, root (setup.sh installs the NOPASSWD rule for the bundled bin/asroot,
+# a compiled helper limited to fixed verbs),
 # macOS 27.0.1 / WindowManager 462.0.8.402 (other builds need a layout profile — `doctor` says so).
 set -u
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -42,7 +43,9 @@ have_root() {
   [ "$(id -u)" = 0 ] && return 0
   sudo -n "$ASROOT" -c true >/dev/null 2>&1
 }
-asroot() { if [ "$(id -u)" = 0 ]; then /bin/zsh -c "$*"; else sudo -n "$ASROOT" -c "$*"; fi; }
+# bin/asroot is a compiled, verb-limited dispatcher: it accepts a fixed verb list and never runs
+# a shell command.  `-c true` is only for the root probe above (and the Swift app's legacy shapes).
+asroot() { if [ "$(id -u)" = 0 ]; then "$ASROOT" "$@"; else sudo -n "$ASROOT" "$@"; fi; }
 need_root() {
   if ! have_root; then
     echo "wmship: no root — '$ASROOT' is not NOPASSWD. Install the rule (admin password once):"
@@ -50,11 +53,6 @@ need_root() {
     echo "  ...written to $SUDOERS (or run $R/setup.sh, which does it for you)"
     exit 1
   fi
-}
-# the tool runs as root through asroot, whose path can contain spaces (an app bundle)
-pyroot() {
-  local f="$S/$1"; shift
-  asroot "$(printf '%q' $PY) $(printf '%q' $f) $(printf '%q ' "$@")"
 }
 # /tmp/wmship is the helper's state directory.  Read-only commands must not create it (a user-run
 # `status` used to recreate it as an empty user-owned directory after `uninstall` had removed it).
@@ -88,21 +86,15 @@ observers_stop() {
   pkill -x r21obs 2>/dev/null
   sleep 0.2
 }
-# the plist is generated from this location on every load: a shipped plist with a baked-in
-# ProgramArguments path is the relocation bug, not a convenience
+# The plist is generated from this location on every load: a shipped plist with a baked-in
+# ProgramArguments path is the relocation bug, not a convenience.  The root-side rendering,
+# mode/owner and relocation check all live in bin/asroot (verb `daemon-load`) so no shell
+# command ever runs as root.
 daemon_load() {
-  local T=$(mktemp /tmp/wmship-plist.XXXXXX) || return 1
-  $PY $R/wmlayout.py plist $T || { rm -f $T; return 1; }
-  asroot "/bin/cp $(printf '%q' $T) $(printf '%q' $PLIST)"
-  asroot "/bin/chmod 644 $PLIST; /usr/sbin/chown root:wheel $PLIST"
-  asroot "/bin/launchctl bootout system/$LABEL 2>/dev/null; /bin/launchctl bootstrap system $(printf '%q' $PLIST)"
-  local rc=$?
-  rm -f $T
-  return $rc
+  asroot daemon-load
 }
 daemon_unload() {
-  asroot "/bin/launchctl bootout system/$LABEL 2>/dev/null"
-  asroot "/bin/rm -f $PLIST"
+  asroot daemon-unload
   pkill -x wmhb 2>/dev/null
   sleep 0.3
 }
@@ -133,12 +125,12 @@ PYEOF
     if [ "$SAME" = "0" ] && $PY $S/install.py status 2>/dev/null | grep -q "^state: *ARMED"; then
       # A rebuilt payload must not be doctor-tested against our own live patch: restore first.
       echo "== payload image changed — restoring the pristine sites before the doctor =="
-      pyroot install.py uninstall >/dev/null 2>&1 || true
+      asroot uninstall >/dev/null 2>&1 || true
     fi
     echo "== doctor =="
-    pyroot install.py doctor || { echo "wmship: doctor refused — nothing installed."; exit 1; }
+    asroot doctor || { echo "wmship: doctor refused — nothing installed."; exit 1; }
     echo "== install =="
-    pyroot install.py install || { echo "wmship: install failed."; exit 1; }
+    asroot install || { echo "wmship: install failed."; exit 1; }
     observers_start
     daemon_load || { echo "wmship: could not load the LaunchDaemon"; exit 1; }
     for i in $(seq 1 40); do
@@ -152,10 +144,10 @@ PYEOF
     need_root
     daemon_unload
     observers_stop
-    pyroot install.py uninstall
+    asroot uninstall
     pkill -x wmhb 2>/dev/null
     echo "== pristine =="
-    pyroot install.py pristine
+    asroot pristine
     echo "lldb: '$(pgrep -x lldb | tr '\n' ' ')'  debugserver: '$(pgrep -f Resources/debugserver | tr '\n' ' ')'  (must be empty)"
     echo "left: wmhb='$(pgrep -x wmhb | tr '\n' ' ')' wmobs='$(pgrep -x wmobs | tr '\n' ' ')' r21obs='$(pgrep -x r21obs | tr '\n' ' ')' wmshipd='$(pgrep -f wmshipd.py | tr '\n' ' ')'  (must be empty)"
     ;;
@@ -163,8 +155,8 @@ PYEOF
     "$0" stop; sleep 0.5; "$0" start ;;
   status)
     need_root
-    $PY $S/install.py status
-    if asroot "launchctl print system/$LABEL" >/dev/null 2>&1; then
+    asroot status
+    if asroot daemon-status >/dev/null 2>&1; then
       echo "launchd: system/$LABEL loaded"
     else
       echo "launchd: system/$LABEL not loaded (no automatic re-apply)"
@@ -173,50 +165,50 @@ PYEOF
   doctor)
     need_root
     shift
-    pyroot install.py doctor "$@"
+    asroot doctor "$@"
     ;;
   pristine)
     need_root
-    pyroot install.py pristine
+    asroot pristine
     ;;
   move)
     need_root; shift
-    pyroot ctl.py move "${1:-current}" "${@:2}"
+    asroot move "${1:-current}" "${@:2}"
     ;;
   resize)
     need_root; shift
-    pyroot ctl.py resize "${1:-1.0}" "${@:2}"
+    asroot resize "${1:-1.0}" "${@:2}"
     ;;
   teach)
     need_root; shift
-    pyroot ctl.py teach
+    asroot teach
     ;;
   selfcheck)
     need_root
-    pyroot ctl.py selfcheck
+    asroot selfcheck
     ;;
   level)
     need_root; shift
-    pyroot ctl.py level "${1:-0}"
+    asroot level "${1:-0}"
     ;;
   warm|measure|cfg|state|poses)
     need_root
-    pyroot ctl.py "$1"
+    asroot "$1"
     ;;
   log)
     if [ "${2:-}" = "-f" ]; then tail -f $D/install.log $D/daemon.log $D/hb.err 2>/dev/null
     else echo "--- install"; tail -12 $D/install.log 2>/dev/null
          echo "--- daemon"; tail -8 $D/daemon.log 2>/dev/null
-         echo "--- payload"; pyroot install.py log 2>/dev/null | tail -12
+         echo "--- payload"; asroot log 2>/dev/null | tail -12
     fi ;;
   uninstall)
     need_root
     "$0" stop || exit 1
-    asroot "/bin/launchctl bootout system/$LABEL 2>/dev/null; /bin/rm -f $PLIST"
+    asroot daemon-unload >/dev/null 2>&1
     # D is root-owned once the daemon has run, so removing it needs root too; and only claim it
     # was removed when it actually was (round 34: `rm -rf` as the user failed silently and the
     # script still printed "removed").
-    if asroot "/bin/rm -rf $D" && [ ! -e $D ]; then
+    if asroot remove-state && [ ! -e $D ]; then
       echo "uninstalled: daemon + plist removed, $D removed, WindowManager pristine."
     else
       echo "uninstalled: daemon + plist removed, WindowManager pristine; WARNING: $D could not be removed (still present)"

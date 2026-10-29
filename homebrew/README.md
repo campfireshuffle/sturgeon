@@ -29,3 +29,7 @@ do not do. The cask is the only supported install path.
 ./scripts/package.sh 1.0.0 36            # unsigned unless SIGN_IDENTITY is set
 brew install --cask ./homebrew/Casks/sturgeon-local.rb
 ```
+
+The end-to-end uninstall proof (`scripts/test-uninstall.sh`) is described in that script's header.
+It installs, arms the live patch, and uninstalls, so it is not part of CI and is never run by a
+release.
