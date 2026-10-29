@@ -67,7 +67,7 @@ ARGS=()
 RC=0
 if [ "$(id -u)" = 0 ]; then
   RES=$("$ASROOT" teardown "${ARGS[@]}" 2>&1) || RC=$?
-elif sudo -n "$ASROOT" -c true >/dev/null 2>&1; then
+elif sudo -n "$ASROOT" probe >/dev/null 2>&1; then
   RES=$(sudo -n "$ASROOT" teardown "${ARGS[@]}" 2>&1) || RC=$?
 else
   # Repair path: the NOPASSWD rule is gone or grants another copy.  One administrator prompt,

@@ -17,7 +17,7 @@
 #      silently re-arm the wrong tree).  Installed, NOT started: `--load` starts it now, and
 #      `wmship.sh start` starts it as part of arming.  launchd loads it at next boot either way.
 #
-# Idempotent: a working NOPASSWD rule is detected with `sudo -n <asroot> -c true` and left alone
+# Idempotent: a working NOPASSWD rule is detected with `sudo -n <asroot> probe` and left alone
 # (no prompt); an identical plist is left alone.  It REFUSES when the path it would grant is not
 # the path it is running from — i.e. a moved/copied app, or a rule that already names a different
 # helper.  Override a stale foreign rule deliberately with --replace.
@@ -74,7 +74,7 @@ say() {
 # ---------------------------------------------------------------- what is already true
 RULE_OK=0
 if [ "$(id -u)" = 0 ]; then RULE_OK=1
-elif sudo -n "$ASROOT" -c true >/dev/null 2>&1; then RULE_OK=1; fi
+elif sudo -n "$ASROOT" probe >/dev/null 2>&1; then RULE_OK=1; fi
 
 T=$(mktemp -d /tmp/stagepilot-setup.XXXXXX) || die "no scratch directory"
 trap '/bin/rm -rf '"$T" EXIT INT TERM
@@ -164,7 +164,7 @@ case $RES in
 esac
 
 # prove the rule works before claiming success
-if ! sudo -n "$ASROOT" -c true >/dev/null 2>&1; then
+if ! sudo -n "$ASROOT" probe >/dev/null 2>&1; then
   say "WARNING: the rule was written but 'sudo -n $ASROOT' still fails — check /etc/sudoers.d syntax"
   exit 1
 fi

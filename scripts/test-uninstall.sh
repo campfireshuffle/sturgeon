@@ -214,7 +214,7 @@ install_and_arm() {
 
   say "setup (one administrator approval)"
   sudo "$APP/Contents/Resources/wmship/setup.sh" || die "setup.sh failed"
-  sudo -n "$APP/Contents/Resources/wmship/bin/asroot" -c true 2>/dev/null \
+  sudo -n "$APP/Contents/Resources/wmship/bin/asroot" probe 2>/dev/null \
     || die "the NOPASSWD rule does not work after setup"
 
   say "arming the patch (wmship.sh start)"
