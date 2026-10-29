@@ -7,12 +7,16 @@ public enum ConfigChange: Equatable {
     /// One toggle, two keys: the keeper replays the pose set and the tiles are raised.
     case onTop(Bool)
     case level(Bool)
+    /// The keeper's per-decision trace (issue #31).  The payload parses this key and writes its
+    /// diagnostics ring; the app reads that ring with `wmship.sh trace`.
+    case trace(Bool)
 
     public var values: [String: Any] {
         switch self {
         case .births(let on): return ["births": on]
         case .onTop(let on): return ["replay": on, "levels": on]
         case .level(let on): return ["level_manual": on ? 3 : 0]
+        case .trace(let on): return ["trace": on]
         }
     }
 
@@ -21,6 +25,7 @@ public enum ConfigChange: Equatable {
         case .births(let on): return "births=\(on)"
         case .onTop(let on): return "replay=\(on) levels=\(on)"
         case .level(let on): return "level_manual=\(on ? 3 : 0)"
+        case .trace(let on): return "trace=\(on)"
         }
     }
 }
@@ -69,6 +74,8 @@ public struct PayloadConfig {
     public var levels: Bool { values["levels"] as? Bool ?? false }
     public var levelManual: Int { values["level_manual"] as? Int ?? 0 }
     public var scale: Double { values["s"] as? Double ?? 1.0 }
+    /// `payload.c` reads this exact key (`jbool(cfg, "trace", …)`), default off.
+    public var trace: Bool { values["trace"] as? Bool ?? false }
     public var onTop: Bool { replay && levels }
     public var level3: Bool { levelManual == 3 }
 

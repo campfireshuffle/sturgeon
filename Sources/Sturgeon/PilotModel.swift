@@ -31,12 +31,18 @@ final class PilotModel: ObservableObject {
     @Published var onTop = false
     @Published var level3 = false
     @Published var scale: Double = 1.0
+    /// The diagnostic `trace` key (issue #31).  Only meaningful while armed.
+    @Published var trace = false
 
     // diagnostics
     @Published var diagnosticsOpen = false
     @Published var lastResize: ResizeReport?
     @Published var fullCounters: CountersReport?
     @Published var countersNote: String?
+    /// The last `wmship.sh trace` read, or `nil` before the first read / after trace is turned
+    /// off.  Its three states keep a refusal and an empty ring from looking like "no decisions".
+    @Published var traceRead: TraceRead?
+    @Published var traceShowing = false
     @Published var lastError: String?
     @Published var ambiguousDrops = 0
     @Published var inputStatus = "off (disarmed)"
@@ -89,6 +95,13 @@ final class PilotModel: ObservableObject {
     private var selfcheckID = 0
     /// The WindowManager pid the current verdict belongs to; a change re-opens the gate.
     private var preflightWMPID: Int?
+    /// The trace toggle's state comes from the payload config once per armed session.  The status
+    /// document does not echo `trace`, so without this an app restart would show "off" while the
+    /// keeper is still writing records.
+    private var traceConfigLoaded = false
+    private var traceConfigLoading = false
+    /// Invalidates a config read whose result was overtaken by a toggle.
+    private var traceConfigID = 0
     private var lastStatusAt = Date.distantPast
     private var lastStagesAt = Date.distantPast
     /// Keeps the strip rect fresh while armed, even with the popover closed.  The gesture needs
@@ -179,10 +192,17 @@ final class PilotModel: ObservableObject {
         guard armed else {
             fullCounters = nil
             countersNote = nil
+            // Disarmed means the key cannot be written and the ring cannot be read: drop the
+            // local state rather than leaving a toggle that claims a feature it cannot reach.
+            trace = false
+            traceRead = nil
+            traceShowing = false
+            traceConfigLoaded = false
             inputRearms = inputTap.rearmCount
             inputStatus = inputTap.statusText
             return
         }
+        if !traceConfigLoaded { loadTraceConfig() }
         inputTap.ensureEnabled()
         Backend.queue.async {
             let result = Backend.run(.counters)
@@ -204,6 +224,24 @@ final class PilotModel: ObservableObject {
                 }
                 self.inputRearms = self.inputTap.rearmCount
                 self.inputStatus = self.inputTap.statusText
+            }
+        }
+    }
+
+    /// One config read per armed session, so the toggle reflects the payload rather than the
+    /// app's default.  A toggle that lands while this is in flight wins: its write bumps
+    /// `traceConfigID` and this completion is discarded.
+    private func loadTraceConfig() {
+        guard !traceConfigLoading else { return }
+        traceConfigLoading = true
+        let id = traceConfigID
+        Backend.queue.async {
+            let config = Backend.config()
+            DispatchQueue.main.async {
+                self.traceConfigLoading = false
+                guard id == self.traceConfigID, let config else { return }
+                self.trace = config.trace
+                self.traceConfigLoaded = true
             }
         }
     }
@@ -270,6 +308,13 @@ final class PilotModel: ObservableObject {
             births = false
             onTop = false
             level3 = false
+        }
+        if !report.isArmed {
+            trace = false
+            traceRead = nil
+            traceShowing = false
+            traceConfigLoaded = false
+            traceConfigID += 1
         }
         inputTap.setBaseScale(scale)
         updateInputs()
@@ -384,26 +429,89 @@ final class PilotModel: ObservableObject {
         writeConfig(.level(v))
     }
 
+    /// The trace key (issue #31).  Turning it off also drops the last read: the popover must not
+    /// keep showing decisions from a ring that is no longer being written.
+    func setTrace(_ v: Bool) {
+        guard armed else {
+            trace = false
+            footer = "not armed — the payload config is not writable"
+            return
+        }
+        trace = v
+        traceConfigID += 1
+        traceConfigLoaded = true
+        if !v {
+            traceRead = nil
+            traceShowing = false
+        }
+        writeConfig(.trace(v))
+    }
+
+    /// Reads the ring through `wmship.sh trace` → the helper's `trace` verb.  Never called while
+    /// the key is off: with no ring being written, a table would be a claim, not an observation.
+    func showTrace() {
+        guard armed else {
+            traceRead = nil
+            footer = "trace → not armed"
+            return
+        }
+        guard trace else {
+            traceRead = nil
+            footer = "trace → enable the toggle first"
+            return
+        }
+        guard !traceShowing, !busy else { return }
+        traceShowing = true
+        // Clear the previous table: a read in flight must not leave old rows under a new request.
+        traceRead = nil
+        footer = "trace → reading the keeper ring…"
+        Backend.queue.async {
+            let read = TraceRead(result: Backend.run(.trace))
+            DispatchQueue.main.async {
+                self.traceShowing = false
+                // An arm/disarm or a toggle-off while the read was in flight owns the state.
+                guard self.armed, self.trace else { return }
+                self.traceRead = read
+                switch read {
+                case .records(let rows, let total):
+                    self.footer = "trace → last \(rows.count) of \(total) record(s)"
+                case .unavailable(let why):
+                    self.footer = "trace → unavailable: \(why)"
+                case .failed(let why):
+                    self.footer = "trace → failed: \(why)"
+                    self.lastError = "trace failed: \(why)"
+                }
+            }
+        }
+    }
+
     private func writeConfig(_ change: ConfigChange) {
         guard armed else {
             footer = "not armed — the payload config is not writable"
             return
         }
+        // The trace key is the one config value `status --json` does not echo, so take the
+        // read-back (or, if the read failed, the previous value) instead of trusting the toggle.
+        let previousTrace = trace
         busy = true
         footer = "writing cfg \(change.label)…"
         Backend.queue.async {
             var config = Backend.config() ?? PayloadConfig()
             config.apply(change)
             let written = Backend.writeConfig(config)
-            let after = Backend.config() ?? PayloadConfig()
+            let after = Backend.config()
             DispatchQueue.main.async {
                 self.busy = false
                 // Any other write invalidates the gesture's cached config; otherwise a gesture
                 // could re-apply a stale `births`/`levels` value it read before this change.
                 self.gestureConfig = nil
                 if written.code == 0 {
-                    self.footer = "cfg \(change.label) → written; read-back \(after.brief)"
+                    if case .trace = change, let after { self.trace = after.trace }
+                    var readBack = after?.brief ?? "unavailable"
+                    if case .trace = change { readBack += " trace=\(self.trace)" }
+                    self.footer = "cfg \(change.label) → written; read-back \(readBack)"
                 } else {
+                    if case .trace = change { self.trace = after?.trace ?? previousTrace }
                     self.footer = "cfg \(change.label) → error: \(Self.lastLine(written.combined))"
                     self.lastError = Self.lastLine(written.combined)
                 }
@@ -782,6 +890,9 @@ final class PilotModel: ObservableObject {
             gesture: inputStatus,
             ambiguousDrops: ambiguousDrops,
             inputRearms: inputRearms,
+            traceOn: trace,
+            traceRecordCount: trace ? traceRead?.total : nil,
+            traceNote: trace ? traceRead?.note : nil,
             armed: armed)
     }
 
