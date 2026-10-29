@@ -167,6 +167,71 @@ else
   fail "bin/asroot is missing or not executable"
 fi
 
+# ---------------------------------------------------------------- wmship.sh ↔ asroot drift
+section "call surface"
+VERB_LINE=$("$ASROOT_BIN" --verbs 2>/dev/null | sed -n 's/^verbs: //p')
+if [ -n "$VERB_LINE" ]; then
+  pass "asroot publishes its verb list"
+else
+  fail "asroot --verbs has no machine-readable 'verbs:' line"
+fi
+
+# Every verb wmship.sh calls must exist in the helper.  This is the check that would have caught
+# PR #23's teach/selfcheck/resize --teach/doctor --mode/move --cgid landing without a helper
+# update: the shell is the caller, so its verbs are the contract.
+if /usr/bin/python3 - "$T/wmship.sh" "$VERB_LINE" <<'PY'
+import re, sys
+
+src = open(sys.argv[1]).read()
+implemented = set(sys.argv[2].split())
+code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+called = set()
+# literal `asroot <verb>` calls (a value beginning with '-' is the legacy -c probe, not a verb)
+for m in re.finditer(r'\basroot\s+"?([a-z][a-z0-9-]*)"?', code):
+    called.add(m.group(1))
+# `asroot "$1"` in the read-verb dispatcher: take the case arm that feeds it
+for m in re.finditer(r'(?m)^  ([a-z|]+)\)\n\s+need_root\n\s+asroot "\$1"', code):
+    called.update(m.group(1).split("|"))
+called.discard("asroot")
+missing = sorted(called - implemented)
+if missing:
+    print("wmship.sh calls verbs the helper does not implement: %s" % ", ".join(missing),
+          file=sys.stderr)
+    raise SystemExit(1)
+if not called:
+    print("no asroot verb calls found in wmship.sh — the extraction broke", file=sys.stderr)
+    raise SystemExit(1)
+print("called: %s" % " ".join(sorted(called)), file=sys.stderr)
+PY
+then
+  pass "every asroot verb called by wmship.sh is implemented"
+else
+  fail "wmship.sh calls a verb the helper does not implement"
+fi
+
+# Every implemented verb must survive parsing without root: exit 1 ("must run as root"), never 2
+# (refused/unknown).  A verb that only exists in the --verbs text but not in dispatch exits 2.
+if [ "$(id -u)" != 0 ]; then
+  BAD_VERBS=""
+  for v in $VERB_LINE; do
+    case "$v" in
+      resize) "$ASROOT_BIN" resize 1.0 >/dev/null 2>&1 ;;
+      level) "$ASROOT_BIN" level 0 >/dev/null 2>&1 ;;
+      move) "$ASROOT_BIN" move current >/dev/null 2>&1 ;;
+      cfg) "$ASROOT_BIN" cfg >/dev/null 2>&1 ;;
+      *) "$ASROOT_BIN" "$v" >/dev/null 2>&1 ;;
+    esac
+    [ $? = 1 ] || BAD_VERBS="$BAD_VERBS $v"
+  done
+  if [ -z "$BAD_VERBS" ]; then
+    pass "every published verb parses without root and stops at the root check (exit 1)"
+  else
+    fail "verbs that did not exit 1 without root:$BAD_VERBS"
+  fi
+else
+  printf 'skip verb parse checks: running as root\n'
+fi
+
 # ---------------------------------------------------------------- no build leftovers
 section "no build leftovers"
 LEFTOVERS=$(find "$APP" \( -name '*.o' -o -name '*.dylib' \) -print 2>/dev/null)
@@ -271,9 +336,13 @@ else
 fi
 
 # ---------------------------------------------------------------- doctor refuses, never crashes
-section "doctor without root"
+section "doctor (refusal, not a crash)"
+# GitHub's macOS runners grant passwordless sudo to the runner user, so `sudo -n <bundle>/asroot`
+# can succeed there and doctor may run its read-only checks as root (exit 0) — a local machine
+# without the rule refuses instead (exit 1).  Both are accepted; >1 or a signal is a crash.
+# Nothing here starts, installs or arms the patch.
 if [ "$(id -u)" = 0 ]; then
-  printf 'skip doctor: running as root; this check is for the unprivileged refusal path\n'
+  printf 'skip doctor: running as root; this check is for the unprivileged path\n'
 else
   set +e
   DOCTOR_OUT=$(HOME=$LAYOUT_TMP "$T/wmship.sh" doctor 2>&1)
