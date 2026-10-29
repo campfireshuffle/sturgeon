@@ -63,7 +63,9 @@ plutil -lint $APP/Contents/Info.plist >/dev/null
 #     wmship.sh wmlayout.py setup.sh teardown.sh wmlocate.py
 #     install.py -> wmship/install.py   ctl.py -> wmship/ctl.py
 #     wmship/  install.py ctl.py wmshipd.py wmhb wmcls payload.img payload.syms.json
-#              island.o profile.json com.stagemgr.wmshipd.plist
+#              profile.json com.stagemgr.wmshipd.plist
+#              (island.o is an input to build.sh, never a runtime file: notarization inspects
+#               every Mach-O in the bundle, so no .o may be copied in)
 #     wm/      wmobs wmkey wmctl.py wm.py
 #     bin/     asroot wmx r19ax r8state r21probe r21move r20click r21scroll r21gesture r21obs
 #     a/       stagepilot               (the AX stage lister the app's Move menu reads)
@@ -76,7 +78,7 @@ for f in wmship.sh wmlayout.py setup.sh teardown.sh wmlocate.py; do
   chmod 0755 $T/$f
 done
 
-for f in install.py ctl.py wmshipd.py wmhb wmcls payload.img payload.syms.json island.o \
+for f in install.py ctl.py wmshipd.py wmhb wmcls payload.img payload.syms.json \
          profile.json com.stagemgr.wmshipd.plist; do
   [ -e $WORK/wmship/$f ] || { say "missing required file wmship/$f (run scripts/build-helpers.sh and wmship/build.sh)" >&2; exit 1; }
   cp $WORK/wmship/$f $T/wmship/$f
@@ -113,6 +115,12 @@ if strings $APP/Contents/MacOS/$APPNAME | grep -q "/Users/"; then
   exit 1
 fi
 say "relocation guard: no /Users path in the tree or the binary"
+
+# Notarization signs off every Mach-O in the bundle, and nothing at runtime reads an object file.
+# This used to be stripped only by pack/package.sh, so dist/ shipped wmship/island.o while art/
+# did not. Refuse at assembly instead, so every bundle we hand out has the same contents.
+LEFTOVERS=$(find $T \( -name '*.o' -o -name '*.dylib' \) -print 2>/dev/null)
+[ -z "$LEFTOVERS" ] || { say "REFUSING: object/dylib leftovers in the bundle:" >&2; print -r -- "$LEFTOVERS" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 5. sign
 if [ "$SIGN_IDENTITY" = "-" ]; then

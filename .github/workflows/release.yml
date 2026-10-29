@@ -76,6 +76,7 @@ jobs:
           BUILD="${{ inputs.build }}"
           [[ -n "$BUILD" ]] || BUILD="${{ github.run_number }}"
           SIGN_IDENTITY=- ./pack/package.sh "${{ steps.version.outputs.version }}" "$BUILD"
+          ./scripts/selftest.sh art/Sturgeon.app
           # the same artifact name the cask downloads
           ditto -c -k --keepParent art/Sturgeon.app "$RUNNER_TEMP/sturgeon-${{ steps.version.outputs.version }}-macos-arm64.zip"
 
@@ -145,7 +146,7 @@ jobs:
           # No entitlements: with SIP off, root already has task_for_pid against WindowManager, and
           # the release build was verified without one.  Adding com.apple.security.cs.debugger would
           # buy nothing and narrow what the notary service accepts.
-          for b in "$tree"/bin/wmx "$tree"/wmship/wmhb "$tree"/wmship/wmcls \
+          for b in "$tree"/bin/asroot "$tree"/bin/wmx "$tree"/wmship/wmhb "$tree"/wmship/wmcls \
                    "$tree"/bin/r19ax "$tree"/bin/r8state "$tree"/bin/r21probe \
                    "$tree"/bin/r21move "$tree"/bin/r21scroll "$tree"/bin/r21gesture \
                    "$tree"/bin/r21obs "$tree"/bin/r20click "$tree"/a/stagepilot \
