@@ -14,6 +14,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -502,6 +503,93 @@ class ApplyScaleTeachesOnlyWhenNeeded(unittest.TestCase):
         calls = [c.kwargs for c in self.cfg.call_args_list]
         self.assertEqual(calls[-1], {"teach": True})
         self.assertTrue(any(c.get("teach") is False for c in calls))
+
+
+class SettleWait(unittest.TestCase):
+    """#4: the teach path waits for the payload's settled flag, bounded, never a fixed sleep."""
+
+    def test_returns_as_soon_as_every_tile_has_a_base(self):
+        seq = [[], [{"wid": 1, "base": 1}], [{"wid": 1, "base": 1}]]
+        n = {"i": 0}
+        sweeps = []
+
+        def poses():
+            row = seq[min(n["i"], len(seq) - 1)]
+            n["i"] += 1
+            return row
+
+        with mock.patch.object(C, "poses", side_effect=poses), \
+                mock.patch.object(C.time, "sleep", return_value=None):
+            missing, issued = C.wait_bases([1], timeout=5.0, sweep=lambda: sweeps.append(1))
+        self.assertEqual(missing, [])
+        self.assertEqual(issued, 0)
+        self.assertEqual(sweeps, [])          # no sweep needed once the flag appears
+
+    def test_is_bounded_when_no_base_ever_settles(self):
+        with mock.patch.object(C, "poses", return_value=[]), \
+                mock.patch.object(C.time, "sleep", return_value=None):
+            t0 = time.time()
+            missing, _ = C.wait_bases([7], timeout=0.05, sweep=lambda: None, resweep=0.0)
+        self.assertEqual(missing, [7])
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_gives_the_payload_a_call_while_a_tile_is_missing(self):
+        # the payload has no timer: it only runs when the WM calls a patched function, so the
+        # wait has to sweep while a tile is missing or the last tile can never settle
+        sweeps = []
+        with mock.patch.object(C, "poses", return_value=[]), \
+                mock.patch.object(C.time, "sleep", return_value=None):
+            C.wait_bases([7], timeout=0.05, sweep=lambda: sweeps.append(1), resweep=0.0)
+        self.assertGreaterEqual(len(sweeps), 1)
+
+
+class ResizeAssertsGeometry(unittest.TestCase):
+    """#3: `resize 1.0` must prove x/y restoration, not only the width ratio."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.wm = mock.Mock()
+        self.wm.force_writes.return_value = 3
+        self.tiles = [{"id": 100 + i, "owner": "Finder", "x": 16, "y": 100 + 120 * i,
+                       "w": 140, "h": 117} for i in range(3)]
+        self.frames = {str(t["id"]): {"x": t["x"], "y": t["y"], "w": t["w"], "h": t["h"]}
+                       for t in self.tiles}
+
+    def run_scale(self, s, frames):
+        bases = [{"wid": t["id"], "base": 1, "mine": 0, "lvl": None} for t in self.tiles]
+        with mock.patch.object(C, "wmctl", return_value=self.wm), \
+                mock.patch.object(C, "rail_tiles", return_value=self.tiles), \
+                mock.patch.object(C, "natural",
+                                  return_value={str(t["id"]): t["w"] for t in self.tiles}), \
+                mock.patch.object(C, "poses", return_value=bases), \
+                mock.patch.object(C, "natural_frames", return_value=frames), \
+                mock.patch.object(C, "cfg_set", mock.Mock(return_value={"gen": 1})), \
+                mock.patch.object(C, "hb", return_value={}), \
+                mock.patch.object(C.time, "sleep", return_value=None), \
+                mock.patch.object(C, "LAST_RESIZE",
+                                  os.path.join(self.tmp.name, "last_resize.json")):
+            return C.apply_scale(s)
+
+    def test_a_tile_that_does_not_come_back_to_its_origin_fails_the_resize(self):
+        moved = dict(self.frames)
+        moved["101"] = dict(moved["101"], x=11)
+        rep = self.run_scale(1.0, moved)
+        self.assertFalse(rep["ok"], rep)
+        self.assertTrue(rep["xy"]["checked"])
+        self.assertFalse(rep["xy"]["ok"])
+        self.assertEqual([m["id"] for m in rep["xy"]["moved"]], [101])
+        self.assertEqual((rep["xy"]["moved"][0]["dx"], rep["xy"]["moved"][0]["dy"]), (5, 0))
+
+    def test_exact_restore_passes(self):
+        rep = self.run_scale(1.0, self.frames)
+        self.assertTrue(rep["ok"], rep)
+        self.assertTrue(rep["xy"]["ok"])
+        self.assertEqual(rep["xy"]["moved"], [])
+
+    def test_geometry_is_not_checked_while_a_scale_is_applied(self):
+        rep = self.run_scale(1.5, self.frames)
+        self.assertFalse(rep["xy"]["checked"])
 
 
 if __name__ == "__main__":

@@ -10,8 +10,8 @@
 #   wmship doctor             resolve + validate all six sites and the object-layout profile
 #   wmship uninstall          stop, then remove the LaunchDaemon and every temp artefact
 #
-#   extras: wmship level 0|3 | warm | measure | teach | selfcheck | cfg | log [-f] | pristine |
-#           restart
+#   extras: wmship level 0|3 | warm | measure | poses | trace | teach | selfcheck | cfg |
+#           log [-f] | pristine | restart
 #
 # The only persistent root process is /Library/LaunchDaemons/com.stagemgr.wmshipd.plist
 # (wmshipd.py), and only while the patch is *armed*: `stop`/`uninstall` boot it out.  It exists
@@ -195,9 +195,9 @@ PYEOF
     need_root; shift
     asroot level "${1:-0}"
     ;;
-  warm|measure|cfg|state|poses)
+  warm|measure|cfg|state|poses|trace)
     need_root
-    asroot "$1"
+    asroot "$@"
     ;;
   log)
     if [ "${2:-}" = "-f" ]; then tail -f $D/install.log $D/daemon.log $D/hb.err 2>/dev/null
@@ -222,6 +222,6 @@ PYEOF
     ;;
   *)
     echo "usage: wmship start|stop|status|move <stage>|resize <scale>|doctor|uninstall"
-    echo "       extras: restart|level 0|3|warm|measure|state|cfg|log [-f]|pristine|teach|selfcheck"
+    echo "       extras: restart|level 0|3|warm|measure|state|poses|trace|cfg|log [-f]|pristine|teach|selfcheck"
     exit 1 ;;
 esac

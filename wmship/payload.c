@@ -134,10 +134,23 @@ u32  io_widcg_gen; u32 io_widcg_len; char io_widcg[8192]; // "<cgid> <serial>" f
 u32  io_rdv;  u32 io_rdv_ack;                             // census rendezvous
 u32  io_ss_len;  char io_ss[64];                          // request state: new/running/done
 u32  io_res_len; char io_res[256];                        // last result JSON
-u32  io_hb_len;  char io_hb[1024];                        // status JSON
+u32  io_hb_len;  char io_hb[1536];                        // status JSON (round 3: the pivot and
+                                                          // settle counters pushed it past 1 KB)
 u32  io_poses_len; char io_poses[2048];                   // per-pose diagnostic "wid base mine lvl"
 u32  io_self_len; char io_self[64];                       // self pointer, hex text
 u32  io_log_w;  char io_log[IOLOG];                       // byte ring, io_log_w monotonic
+// Diagnostic only (issue #31): a ring of keeper decisions, enabled by cfg `trace`.  The keeper is
+// the only place that sees every transform the WM writes, so "was that write a hover lift or a
+// layout pose" is answered from the WM's own stream instead of inferred from a width ratio.
+// Nothing in this file ever reads io_tr: the trace is write-only by construction, so it cannot
+// influence a decision even if its text is corrupted by a partial overwrite.
+//
+//   io_tr_pos  write cursor, always in [0, IOTR); a record never straddles the ring seam
+//   io_tr_len  total bytes ever written (monotonic); the valid byte count is min(len, IOTR)
+//   io_tr_seq  record sequence number (monotonic), the first field of every record
+#define IOTR 16384
+u32  io_tr_pos;  char io_tr[IOTR];
+u32  io_tr_len;  u32 io_tr_seq;
 u64  io_magic;
 u32  io_inj_n;  u64 io_inj_wid[8]; u32 io_inj_cg[8];
 u32  io_mw_n;   u64 io_mw[64];                            // diagnostic: the model at the call
@@ -196,13 +209,18 @@ struct pose {
     double t_rpcand;
     u8 rpcand_ok;
     u8 pad4[7];
+    // Document ticks observed since the candidate write (issue #4).  Reset by every write for this
+    // window, advanced by read_state() for every document the keeper accepts -- so "settled" is
+    // "N documents arrived and none of them carried a newer write", not a wall-clock window.
+    u32 cand_ticks;
+    u32 rpcand_ticks;
 };
 struct globals {
     double t_cfg, t_state, t_req, t_pend, t_log, t_hb;
     int births, replay, dilate, levels, level_manual;
     int use_desc, retain, probe;
     int widcg;
-    double s, qx, qy;
+    double s;
     long gen, gen_applied;
     int force, strip_on;
     // ---- state-channel health (round 33): a document is acted on only when it arrived whole
@@ -223,6 +241,33 @@ struct globals {
     double front_x;
     u32 strip_ids[MAXIDS]; int n_strip;
     u32 rail_ids[MAXIDS]; int n_rail;
+    double rail_w[MAXIDS];  // drawn width per rail id, from the document (trace target only)
+    // ---- the scale pivot (issue #3).  It used to be two constants written by ctl.py `(16, 490)`,
+    // a point that is only the strip's gutter on one display size.  It is now derived from the
+    // document's own rail frames (the leftmost drawn tile x, the vertical centre of the drawn
+    // tiles) and only falls back to the config when `pivot_fixed` asks for it (debug override).
+    double qx, qy;          // config override, used only when pivot_fixed && both were given
+    int has_qx, has_qy, pivot_fixed;
+    double px, py;          // the pivot actually used by mat_scale(), resolved per document
+    int piv_src;            // 1 = rail geometry, 2 = config override, 0 = none (refuse to scale)
+    u64 n_piv_miss;         // scale writes refused because no pivot could be derived
+    // ---- structural base invalidation (issue #4): the rail's id-set is the layout's identity.
+    // When it changes, every base taught against the old layout is stale (the remaining tiles are
+    // drawn wider, so every new candidate is *smaller* in m0 and the largest-m0 rule can never
+    // accept it).  Drop the set and let the next settled write become the base again.
+    u32 rail_key;           // FNV-1a over the app-tile id set of the last layout we adopted
+    u32 rail_key_seen;      // the key currently under observation (must be seen twice)
+    u32 rail_key_geom;      // the key derived from the document just accepted
+    int rail_geom_ok;       // that document carried drawn app-tile geometry
+    int rail_seen_n;        // consecutive documents that agreed on rail_key_seen
+    int doc_drawn;          // the last document said the strip was drawn (layout-identity clock)
+    u32 st_ticks;           // documents between the last two accepted reads (>= 1)
+    u64 n_railchg;          // rail id-set changes acted on
+    u64 n_base_drop;        // bases dropped because the layout changed
+    // ---- the settle detector (issue #4): promotion is "the document advanced N ticks with no
+    // newer write for this window", not "0.22 s of wall clock elapsed".
+    u64 n_unsettled;        // candidates superseded/expired before they settled (issue #4 counter)
+    int trace;              // cfg `trace`: write the keeper decision ring (diagnostic only)
     u64 self;
     int move_pending;
     u64 mw0, mw1;
@@ -284,6 +329,88 @@ static void logf(const char *a, const char *b, i64 v) {
     u32 w = io_log_w;
     for (int i = 0; i < p; i++) io_log[(w + (u32)i) % IOLOG] = o[i];
     io_log_w = w + (u32)p;
+}
+
+// ---------------------------------------------------------------- the pose trace (issue #31)
+// One record per keeper decision, written only when cfg `trace` is on.  There is no printf in a
+// freestanding payload, so the decimal formatter is hand-rolled; it is exact for the small ranges
+// here (window ids < 2^32 are exact in a double, and every other field has <= 4 decimals).
+static int dnum(char *o, int p, double v, int dec) {
+    int neg = 0;
+    if (v < 0) { neg = 1; v = -v; }
+    i64 d = 1;
+    for (int i = 0; i < dec; i++) d *= 10;
+    i64 sc = (i64)(v * (double)d + 0.5);
+    i64 ip = sc / d, rem = sc % d;
+    if (neg && sc) o[p++] = '-';
+    char tmp[24]; int k = 0;
+    if (!ip) tmp[k++] = '0';
+    while (ip) { tmp[k++] = (char)('0' + (int)(ip % 10)); ip /= 10; }
+    while (k) o[p++] = tmp[--k];
+    if (dec) {
+        o[p++] = '.';
+        char ft[12]; int j = 0;
+        for (int i = 0; i < dec; i++) { ft[j++] = (char)('0' + (int)(rem % 10)); rem /= 10; }
+        while (j) o[p++] = ft[--j];
+    }
+    return p;
+}
+// Append one record.  The ring is a byte ring with a cursor that never straddles the seam, so a
+// reader sees every record whole or not at all; `io_tr_len` is the number of bytes ever written
+// (monotonic) and `io_tr_seq` the record number, both so a reader can tell a wrap from a gap.
+static void tr_put(const char *rec, int n) {
+    if (n <= 0 || n >= IOTR) return;
+    u32 pos = io_tr_pos;
+    if (pos + (u32)n >= (u32)IOTR) pos = 0;
+    for (int i = 0; i < n; i++) io_tr[pos + (u32)i] = rec[i];
+    io_tr_pos = pos + (u32)n;
+    __atomic_store_n(&io_tr_len, io_tr_len + (u32)n, __ATOMIC_RELEASE);
+}
+static double rail_w_of(u32 wid) {
+    for (int i = 0; i < G.n_rail; i++) if (G.rail_ids[i] == wid) return G.rail_w[i];
+    return -1.0;
+}
+// The stable line format (documented in the PR and, by the docs stream, in docs/TECHNICAL.md):
+//
+//   <seq> w=<wid> m0=<scale entry> m4=<row1 col0> x=<m12> y=<m13> b0=<base m0|-1>
+//         rw=<drawn width|-1> o=<drawn> u=<ours> b=<has base> T=<teach-legal> r=<retract>
+//         a=<not in rail_now> h=<hold ms left> q=<candidate ticks> c=<candidate held> sm=<scale>
+//
+// o/u/b/T/r/a/h are the issue's own letters; q and c describe the settle detector.  No branch in
+// this file reads this text back -- it is a write-only diagnostic.
+static void trace_one(u32 wid, const double *m, struct pose *p, int out, int ours, int legal,
+                      int retract, int rail, double sm, int hold_ok) {
+    char o[192]; int q = 0;
+    q = dnum(o, q, (double)io_tr_seq, 0); o[q++] = ' ';
+    for (const char *c = "w="; *c; c++) o[q++] = *c;
+    q = dnum(o, q, (double)wid, 0);
+    const char *k[4] = {" m0=", " m4=", " x=", " y="};
+    int dec[4] = {4, 4, 1, 1};
+    double v[4] = {m[0], m[4], m[12], m[13]};
+    for (int i = 0; i < 4; i++) {
+        for (const char *c = k[i]; *c; c++) o[q++] = *c;
+        q = dnum(o, q, v[i], dec[i]);
+    }
+    for (const char *c = " b0="; *c; c++) o[q++] = *c;
+    q = dnum(o, q, p->hasbase ? ((const double *)p->base)[0] : -1.0, 4);
+    for (const char *c = " rw="; *c; c++) o[q++] = *c;
+    q = dnum(o, q, rail_w_of(wid), 1);
+    const char *fk[7] = {" o=", " u=", " b=", " T=", " r=", " a=", " c="};
+    int fv[7] = {out ? 1 : 0, ours ? 1 : 0, p->hasbase ? 1 : 0, legal ? 1 : 0,
+                 retract ? 1 : 0, rail ? 0 : 1, p->cand_ok ? 1 : 0};
+    for (int i = 0; i < 7; i++) {
+        for (const char *c = fk[i]; *c; c++) o[q++] = *c;
+        o[q++] = (char)('0' + fv[i]);
+    }
+    for (const char *c = " h="; *c; c++) o[q++] = *c;
+    q = dnum(o, q, hold_ok ? 0.0 : (G.hold_until - now()) * 1000.0, 0);
+    for (const char *c = " q="; *c; c++) o[q++] = *c;
+    q = dnum(o, q, (double)(p->cand_ok ? p->cand_ticks : 0u), 0);
+    for (const char *c = " sm="; *c; c++) o[q++] = *c;
+    q = dnum(o, q, sm, 3);
+    o[q++] = '\n';
+    io_tr_seq++;
+    tr_put(o, q);
 }
 
 // ---------------------------------------------------------------- status heartbeat
@@ -395,6 +522,13 @@ static void hb_write(void) {
     p = key64(o, p, "rej", G.n_rej);        o[p++] = ',';
     p = key64(o, p, "probe", (u64)G.probe); o[p++] = ',';
     p = key64(o, p, "cfg", G.n_cfg);        o[p++] = ',';
+    // ---- round 3: the pivot in use, the structural invalidation, and the settle counter
+    p = key64(o, p, "px", (u64)(i64)G.px);  o[p++] = ',';
+    p = key64(o, p, "py", (u64)(i64)G.py);  o[p++] = ',';
+    p = key64(o, p, "psrc", (u64)G.piv_src); o[p++] = ',';
+    p = key64(o, p, "unsettled", G.n_unsettled); o[p++] = ',';
+    p = key64(o, p, "railchg", G.n_railchg); o[p++] = ',';
+    p = key64(o, p, "pivmiss", G.n_piv_miss); o[p++] = ',';
     p = key64(o, p, "self", G.self % 1000000007UL); o[p++] = ',';
     p = key64(o, p, "t", (u64)now());
     if (p > (int)sizeof(io_hb) - 2) p = (int)sizeof(io_hb) - 2;   // never overrun the page
@@ -487,7 +621,7 @@ static int jints(const char *s, const char *key, u32 *out, int max) {
 
 // ---------------------------------------------------------------- control plane, in memory
 static void read_cfg(void) {
-    if (!G.inited) { G.inited = 1; G.use_desc = 0; G.retain = 1; G.births = 1; G.replay = 1; G.levels = 1; G.teach = 1; G.s = 1.0; G.qx = 16.0; G.qy = 490.0; G.widcg = 1; }
+    if (!G.inited) { G.inited = 1; G.use_desc = 0; G.retain = 1; G.births = 1; G.replay = 1; G.levels = 1; G.teach = 1; G.s = 1.0; G.widcg = 1; }
     if (G.cfg_seen == io_cfg_gen) return;
     G.cfg_seen = io_cfg_gen;
     char *cfg = snap(B_cfg, io_cfg, io_cfg_len, sizeof(B_cfg));
@@ -510,8 +644,13 @@ static void read_cfg(void) {
     if (jbool(cfg, "verbose", (int *)&v)) G.verbose = (int)v;
     if (jint(cfg, "level_manual", &v)) G.level_manual = (int)v;
     jdbl(cfg, "s", &G.s);
-    jdbl(cfg, "qx", &G.qx);
-    jdbl(cfg, "qy", &G.qy);
+    // Issue #3: the pivot is geometry-derived unless `pivot_fixed` asks for the config values.
+    // `has_qx`/`has_qy` record that the key was actually present, so "absent" cannot mean 0,0.
+    if (jdbl(cfg, "qx", &G.qx)) G.has_qx = 1;
+    if (jdbl(cfg, "qy", &G.qy)) G.has_qy = 1;
+    if (jbool(cfg, "pivot_fixed", (int *)&v)) G.pivot_fixed = (int)v;
+    // Issue #31: diagnostic ring, default off; nothing else in this file reads it.
+    if (jbool(cfg, "trace", (int *)&v)) G.trace = (int)v;
     if (jint(cfg, "gen", &v)) G.gen = v;
 }
 static int in_ids(u32 wid, const u32 *ids, int n) {
@@ -559,6 +698,92 @@ static double rail_rect_x(const char *st) {
     return best == 1e9 ? -1e9 : best;
 }
 
+// ---------------------------------------------------------------- the pivot, from geometry (issue #3)
+// `mat_scale()` scales every tile about one pivot expressed in the pose's own source space.  That
+// pivot used to be the literal pair (16, 490) written by `ctl.py` -- the strip's left edge and
+// vertical centre on one display size, and nothing at all on another.  The document already
+// carries what is needed to re-derive it: the `rail` array gives each drawn tile's frame, so
+//
+//     qx = the leftmost drawn tile's x        (the strip's gutter edge)
+//     qy = the vertical centre of the drawn tiles' extent
+//
+// is the same pair expressed in the geometry that is on screen right now.  It is recomputed for
+// every accepted document, so a different display, a moved strip, a different tile count or a
+// resolution change all move the pivot with it.
+//
+// Only app-owned tiles count.  WindowManager owns the gutter's own blocker/overlay windows, whose
+// frames move with a hover (they are how the WM keeps the pointer off the tiles it has not lifted);
+// letting them into either the pivot or the layout identity makes the value twitch under the
+// pointer.  `rail_geom()` returns 0 when the document has no drawn app tile, and scaling is then
+// refused (`n_piv_miss`) rather than done about a guessed point.  `pivot_fixed` in the cfg
+// (`{"pivot_fixed":true,"qx":…,"qy":…}`) restores the old behaviour for a debugging session.
+static int rail_geom(const char *st, double *ox, double *oy, u32 *key) {
+    const char *p = jkey(st, "rail");
+    if (!p) return 0;
+    double mnx = 1e9, mny = 1e9, mxy = -1e9;
+    u32 k = 2166136261u;                     // FNV-1a over the id set; order-independent enough
+    int n = 0;
+    for (const char *q = p; *q && *q != ']'; q++) {
+        if (*q != '{') continue;
+        const char *e = q;
+        int depth = 0;
+        while (*e) {
+            if (*e == '{') depth++;
+            else if (*e == '}' && --depth == 0) break;
+            e++;
+        }
+        if (*e != '}') break;
+        int len = (int)(e - q + 1);
+        if (len > 1 && len < 256) {
+            char it[256];
+            for (int i = 0; i < len; i++) it[i] = q[i];
+            it[len] = 0;
+            long id = 0;
+            double x = 0, y = 0, h = 0, w = 0;
+            char ow[48];
+            if (jint(it, "id", &id) && jdbl(it, "x", &x) && jdbl(it, "y", &y)
+                && jdbl(it, "h", &h) && jdbl(it, "w", &w) && jstr(it, "owner", ow, sizeof(ow))
+                && in_ids((u32)id, G.rail_ids, G.n_rail)
+                && !(ow[0] == 'W' && memcmp(ow, "WindowManager", 13) == 0)) {
+                if (x < mnx) mnx = x;
+                if (y < mny) mny = y;
+                if (y + h > mxy) mxy = y + h;
+                for (int i = 0; i < G.n_rail; i++)
+                    if (G.rail_ids[i] == (u32)id) { G.rail_w[i] = w; break; }
+                k ^= (u32)id; k *= 16777619u;
+                n++;
+            }
+        }
+        q = e;
+    }
+    if (!n || mnx > 1e8 || mny > 1e8) return 0;
+    *ox = mnx;
+    *oy = (mny + mxy) * 0.5;
+    if (key) *key = k ^ (u32)n;
+    return 1;
+}
+
+// Which pivot to use, and whether scaling is allowed at all.  Called once per accepted document.
+static void resolve_pivot(const char *st) {
+    u32 key = 0;
+    double gx = 0, gy = 0;
+    int have = rail_geom(st, &gx, &gy, &key);
+    if (G.pivot_fixed && G.has_qx && G.has_qy) {
+        G.px = G.qx; G.py = G.qy; G.piv_src = 2;
+    } else if (have) {
+        G.px = gx; G.py = gy; G.piv_src = 1;
+    } else {
+        G.piv_src = 0;                       // no geometry yet: do not scale about a guess
+    }
+    if (have) {
+        if (key != G.rail_key_geom) {
+            G.rail_key_geom = key;
+            if (G.verbose) logf("RAILGEOM n=", 0, (i64)G.n_rail);
+        }
+    }
+    G.rail_geom_ok = have;
+}
+
 // Accept a state document only if the helper's seqlock is even (not mid-write) and did not change
 // under the copy, it is complete JSON, and it carries both of the keys the keeper acts on.
 static void state_freshness(void) {
@@ -568,6 +793,7 @@ static void state_freshness(void) {
 }
 static void read_state(void) {
     u32 g0 = io_st_gen;
+    u32 dt = 0;
     if (g0 == G.st_seen) { state_freshness(); return; }
     if (g0 & 1) { G.n_st_busy++; state_freshness(); return; }   // publisher mid-write
     if (!io_st_len) { state_freshness(); return; }
@@ -575,6 +801,13 @@ static void read_state(void) {
     char *st = snap(B_st, io_st, io_st_len, sizeof(B_st));
     u32 g1 = io_st_gen;
     if (g1 != g0) { G.n_st_busy++; state_freshness(); return; }  // torn: keep the last good doc
+    // Document ticks (issue #4): the seqlock advances by two per published document, so the
+    // generation delta *is* the number of documents the keeper did not see.  It is counted here
+    // and applied below, after the document has been accepted, so a torn or truncated read can
+    // neither invent a settle nor break one.
+    dt = (u32)(g0 - G.st_seen) / 2u;
+    if (!dt) dt = 1;
+    if (dt > 64u) dt = 64u;
     G.st_seen = g0;
     G.t_state = now();
     // completeness: the last non-space byte of the document is its closing brace
@@ -586,6 +819,17 @@ static void read_state(void) {
         break;
     }
     G.st_complete = done;
+    // Candidates advance before this call's own write can reset them, which is what makes
+    // "N documents arrived, no newer write" an observation rather than a timer.
+    if (G.st_complete) {
+        for (int i = 0; i < MAXP; i++) {
+            struct pose *q = &G.pose[i];
+            if (!q->used) continue;
+            if (q->cand_ok && q->cand_ticks < 0xFFFFu) q->cand_ticks += dt;
+            if (q->rpcand_ok && q->rpcand_ticks < 0xFFFFu) q->rpcand_ticks += dt;
+        }
+        G.st_ticks = dt;
+    }
     long v;
     G.has_flush = jbool(st, "flush", (int *)&v);
     if (G.has_flush) G.force = (int)v;
@@ -595,7 +839,27 @@ static void read_state(void) {
     G.n_strip = jints(st, "strip_ids", G.strip_ids, MAXIDS);
     G.has_rail = jkey(st, "rail_now") != 0;
     G.n_rail = jints(st, "rail_now", G.rail_ids, MAXIDS);
+    for (int i = 0; i < MAXIDS; i++) G.rail_w[i] = -1.0;
     G.rail_x = rail_rect_x(st);
+    if (G.st_complete) resolve_pivot(st);
+    else G.rail_geom_ok = 0;                 // never take a pivot or a layout from a partial doc
+    // Layout identity (issue #4), counted per *document*, not per call: the payload is only called
+    // when the WM touches a patched site, and a reflow burst can end between two calls.  A key has
+    // to agree across two published documents before the keeper acts on it, so one transient
+    // membership is not a layout change.
+    G.doc_drawn = (G.st_complete && G.n_rail > 0 && G.rail_x >= 0.0 && G.strip_on
+                   && G.has_frontx && G.front_x > 60.0);
+    if (G.rail_geom_ok && G.doc_drawn) {
+        if (G.rail_key_geom != G.rail_key_seen) {
+            G.rail_key_seen = G.rail_key_geom;
+            G.rail_seen_n = 0;
+            if (G.verbose) logf("RAILSEEN key=", 0, (i64)(G.rail_key_seen & 0x7FFFFFFF));
+        }
+        // The stability count is in *documents*, and the seqlock delta says how many were
+        // published since the last read -- so a layout that settled while the payload was not
+        // being called still counts, instead of waiting for two calls that may never come.
+        if (G.rail_seen_n < 1000) G.rail_seen_n += (int)(G.st_ticks < 1000u ? G.st_ticks : 1u);
+    }
     state_freshness();
     if (G.st_ok) G.n_st_ok++;
     else {
@@ -1513,8 +1777,10 @@ static void apply_all(void) {
         if (scaled ? !p->hasbase : !(p->hasbase || p->hasrp)) continue;
         double base[16];
         memcpy(base, (scaled || p->hasbase) ? p->base : p->rp, 128);
-        if (scaled) mat_scale(base, s, G.qx, G.qy, mm[n]);
-        else memcpy(mm[n], base, 128);
+        if (scaled) {
+            if (!G.piv_src) { G.n_piv_miss++; continue; }   // no geometry: never scale about a guess
+            mat_scale(base, s, G.px, G.py, mm[n]);
+        } else memcpy(mm[n], base, 128);
         ids[n++] = G.rail_ids[i];
     }
     if (!n) return;
@@ -1559,16 +1825,26 @@ static int is_retract(const double *m, const u8 *b) {
 // ---- a resting base is a pose the WM stops writing -------------------------------------------
 // Measured on this build: one hover animates a tile through hundreds of distinct scale values in
 // ~0.5 s, the resting pose is written once, and the next write for that window comes ~0.3 s later
-// or never (idle produces no writes at all).  So "is this write the rest pose" is answered by
-// time, not by a value.  Record every legal write as a candidate and promote it only when the
-// window has been written nothing else for QUIET.  A lift cannot pass that test -- it is followed
-// by the settle writes when the pointer leaves -- and neither can a mid-animation frame.
+// or never (idle produces no writes at all).  So "is this write the rest pose" is answered by the
+// stream, not by a value: record every legal write as a candidate and promote it only when the
+// pose stream has been quiet for it.
 //
-// The round-34 rule this replaces ("keep the smallest pose") never gated at all: `p->base` is a
-// u8[128], so `p->base[0]` is ONE BYTE of the base's first double, an integer no scale can be
-// smaller than.  It kept the last write of a sweep -- a hover lift -- which is where 1.58 came
-// from.  Cast to double before comparing, always.
-#define QUIET   0.22    // longer than the longest gap inside one animation (measured 0.13 s)
+// Round 3 replaced the fixed 0.22 s window with a **settle detector on the document clock**
+// (issue #4).  Every published document is one tick (`read_state()` counts the seqlock delta, so
+// a payload that was not called for a while still sees every document it missed), a write for
+// this window resets its tick counter, and a candidate is promoted only when
+//
+//     SETTLE_TICKS documents have arrived with no newer write for that window
+//     and the document still says the strip is drawn (checked again at promotion time)
+//
+// Margins, measured on this build: the longest gap *inside* one animation is 0.13 s ≈ 5 ticks at
+// the observer's 25 ms cadence, so SETTLE_TICKS = 8 is a 54 % margin; post-retract silence is
+// ≥ 0.3 s ≈ 12 ticks, and a retract cannot be promoted anyway because `out` goes false within a
+// tick or two of it starting.  The old wall-clock 0.22 s was the same length but assumed the
+// machine could schedule the payload; the tick count is what the document actually published.
+// `CAND_TTL` stays a wall-clock bound: a candidate that never settles is dropped rather than kept
+// forever, and a tick counter that stops advancing (observer dead) must not promote anything.
+#define SETTLE_TICKS 8u
 #define CAND_TTL 3.00   // longer than one sweep's period (2 passes over tiles, measured ~3 s)
 static int strip_out_now(void) {
     return G.st_ok && G.strip_on && G.n_rail > 0 && G.rail_x >= 0.0
@@ -1594,10 +1870,10 @@ static void promote_one(struct pose *p, double t, int out) {
     p->t_base = t;
     G.n_learn++;
 }
-// Called (a) before this window's next write -- a write that arrives QUIET after a candidate is
+// Called (a) before this window's next write -- a write that arrives after the settle window is
 // the proof that the candidate was the end of its animation -- and (b) at a cfg generation change,
-// which is where the base is actually consumed.  Idle produces no writes at all, so (b) is what
-// settles the last tile of a sweep.
+// which is where the base is consumed.  Idle produces no writes at all; the document ticks still
+// advance, so a candidate can settle with the pointer at rest.
 static void promote_one_rp(struct pose *p, double t, int out) {
     p->rpcand_ok = 0;
     if (!out) return;                       // never take the hidden pose, whatever it looked like
@@ -1615,12 +1891,16 @@ static void promote_bases(void) {
         struct pose *p = &G.pose[i];
         if (!p->used) continue;
         if (p->cand_ok) {
-            if (t - p->t_cand > CAND_TTL) p->cand_ok = 0;
-            else if (t - p->t_cand >= QUIET) promote_one(p, t, out);
+            if (t - p->t_cand > CAND_TTL) {
+                p->cand_ok = 0;
+                G.n_unsettled++;
+            } else if (p->cand_ticks >= SETTLE_TICKS) {
+                promote_one(p, t, out);
+            }
         }
         if (p->rpcand_ok) {
             if (t - p->t_rpcand > CAND_TTL) p->rpcand_ok = 0;
-            else if (t - p->t_rpcand >= QUIET) promote_one_rp(p, t, out);
+            else if (p->rpcand_ticks >= SETTLE_TICKS) promote_one_rp(p, t, out);
         }
     }
 }
@@ -1666,6 +1946,45 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
               && G.has_frontx && G.front_x > 60.0;
     int ours = p->hasmine && memcmp(m, p->mine, 128) == 0;
 
+    // ---- structural base invalidation (issue #4) -----------------------------------------------
+    // A base describes the drawing that is on screen right now.  A hide drops it (below), but a
+    // tile set can also change *in place*: close a window in the strip and the WM re-lays out the
+    // rest wider without ever hiding it.  Every later candidate then has a smaller m0 than the
+    // stale base (m0 is natural/drawn, and a wider drawing is a smaller m0), so the largest-m0 rule
+    // refuses all of them and neither `resize` nor `teach` can recover without a hide.  That stale
+    // base is what renders 1.575 where 1.5 was asked for.
+    //
+    // The rail's app-tile id-set is the layout's identity, so a change to it clears the set.  The
+    // key is adopted only after two consecutive documents agree, so a one-tick membership glitch
+    // during a reveal cannot cost a teach pass.  WindowManager's own gutter windows are excluded on
+    // purpose (rail_geom): they appear and disappear under the pointer.
+    //
+    // `-DWM_NO_RAILCHG` (build.sh NO_RAILCHG=1) removes this block.  It exists only as the negative
+    // control for the stale-base trial -- the build that reproduces 1.57 -- and is never defined by
+    // the shipped build.
+#ifndef WM_NO_RAILCHG
+    if (fresh && out && G.rail_geom_ok && G.rail_seen_n >= 2
+        && G.rail_key_geom != G.rail_key) {
+        u32 k = G.rail_key_geom;
+        if (G.rail_key) {                  // not the first layout this payload has ever seen
+            int dropped = 0;
+            for (int i = 0; i < MAXP; i++) {
+                struct pose *q = &G.pose[i];
+                if (!q->used) continue;
+                if (q->hasbase) dropped++;
+                q->hasbase = 0;            // a stale pose; the next settle re-teaches it
+                q->cand_ok = 0;
+                q->cand_ticks = 0;
+            }
+            G.n_base_drop += (u64)dropped;
+            G.n_railchg++;
+            logf("RAILCHG bases dropped=", 0, (i64)dropped);
+        }
+        logf("RAILKEY key=", 0, (i64)(k & 0x7FFFFFFF));
+        G.rail_key = k;
+    }
+#endif
+
     // ---- the teach gate (D2) -------------------------------------------------------------------
     // The WM retracts the strip *before* the observer's `flush` flag can reach the payload, so the
     // first writes of a flush are the retract itself.  Learning is allowed only while the strip is
@@ -1710,17 +2029,18 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     //
     //   1. every write that arrives while the document says the strip is drawn and that is not our
     //      own becomes the *candidate* (`rpcand`);
-    //   2. a candidate is promoted only after QUIET (0.22 s) with no newer write for that window,
-    //      and only if the document still says the strip is drawn at promotion time;
+    //   2. a candidate is promoted only when SETTLE_TICKS documents have arrived with no newer
+    //      write for that window, and only if the document still says the strip is drawn at
+    //      promotion time;
     //   3. a candidate written before the strip last came out (`t_out_since`) is never promoted.
     //
     // The margins that make that safe against a retract, which is what it has to survive:
-    //   * the longest gap *inside* one animation is 0.13 s (measured on this build), so a frame of
-    //     an animation is always superseded before QUIET elapses;
+    //   * the longest gap *inside* one animation is 0.13 s ≈ 5 documents (measured on this build),
+    //     so an animation frame is always superseded before 8 ticks elapse;
     //   * the document is republished every ~25 ms (`r21obs`), and a retract is ~0.3 s of writes,
     //     so `out` goes false within a tick or two of the retract starting: the last retract frame
-    //     would have to be followed by 0.22 s of silence *and* the document would have to still
-    //     say "drawn", which is 25 ms of lag against 220 ms of quiet -- it cannot be both;
+    //     would have to be followed by 8 documents of silence *and* the document would have to
+    //     still say "drawn" -- it cannot be both;
     //   * and if it somehow were, rule 3 rejects it: after the next reveal `t_out_since` is newer
     //     than that candidate.
     // This replaced a per-write refresh, which does follow the strip out: measured, six tiles
@@ -1731,16 +2051,17 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     if (!ours && !is_identity(m) && out) {
         memcpy(p->rpcand, m, 128);
         p->t_rpcand = now();
+        p->rpcand_ticks = 0;
         p->rpcand_ok = 1;
     } else {
         p->rpcand_ok = 0;
     }
 
-    // The resting base: the last write the WM made for this window and then stopped writing for
-    // QUIET seconds.  Every gate above still decides *what may become a candidate* -- never a
-    // retract pose, never a write while the scale is not 1.0, never our own write, never inside a
-    // strip-transition hold -- and promotion happens in promote_bases(), where the document is
-    // re-read.  Promotion, not capture, is what makes the base a settled pose rather than a frame.
+    // The resting base: the last write the WM made for this window and then stopped writing about.
+    // Every gate above still decides *what may become a candidate* -- never a retract pose, never a
+    // write while the scale is not 1.0, never inside a strip-transition hold -- and promotion
+    // happens in promote_bases(), where the document is re-read.  Promotion, not capture, is what
+    // makes the base a settled pose rather than a frame.
     int hold_ok = now() >= G.hold_until;
     // `!ours` is deliberately NOT part of this: the pose that matters most is the one the WM writes
     // when it settles, and after a replay that pose is byte-identical to our own last write.  With
@@ -1749,7 +2070,7 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     // no-op by construction (promote_one returns when the candidate already is the base), and at
     // any other scale the `feq(s, 1.0)` term already excludes it.
     int legal = feq(s, 1.0) && !is_identity(m) && out && hold_ok && !retract;
-    if (p->cand_ok && now() - p->t_cand >= QUIET && now() - p->t_cand <= CAND_TTL && G.teach)
+    if (p->cand_ok && p->cand_ticks >= SETTLE_TICKS && now() - p->t_cand <= CAND_TTL && G.teach)
         promote_one(p, now(), out);      // this write proves the candidate ended its burst
     if (!G.teach) {
         // the tool is sweeping or measuring: record nothing, and do not throw away a candidate it
@@ -1757,10 +2078,16 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     } else if (legal) {
         memcpy(p->cand, m, 128);
         p->t_cand = now();
+        p->cand_ticks = 0;
         p->cand_ok = 1;
     } else {
-        p->cand_ok = 0;                  // this write supersedes anything pending for this window
+        // this write supersedes anything pending for this window; if it arrived before the
+        // candidate could settle, that candidate is exactly the "rejected as unsettled" count
+        // issue #4 asks to expose.
+        if (p->cand_ok && p->cand_ticks < SETTLE_TICKS) G.n_unsettled++;
+        p->cand_ok = 0;
     }
+    if (G.trace) trace_one(wid, m, p, out, ours, legal, retract, rail, s, hold_ok);
     G.last_mx = m[12];
     if (force) {
         // Replay what was last drawn on screen, not what the tile rests at: under a flush the
@@ -1785,14 +2112,14 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
                 memcpy(p->mine, p->base, 128);
                 G.n_dil++;
             }
-        } else if (G.dilate) {
+        } else if (G.dilate && G.piv_src) {
             // always from the base, never gated on `ours` (round 34): a tile that already carries
             // our *1.0* matrix from the previous phase gets its own matrix written back by the WM,
             // `ours` is then true, and the old `!ours` gate skipped it -- so it kept the old scale
             // and the strip scaled 5 of 6 tiles.  Recomputing from the base is idempotent when the
             // write already carries the right matrix.
             double o[16];
-            mat_scale((const double *)p->base, s, G.qx, G.qy, o);
+            mat_scale((const double *)p->base, s, G.px, G.py, o);
             if (memcmp(m, o, 128) != 0) {
                 memcpy((void *)matp, o, 128);
                 memcpy(p->mine, o, 128);

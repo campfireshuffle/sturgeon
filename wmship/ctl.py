@@ -13,6 +13,7 @@ observers that only read CGWindowList / AX.  No debugger, no task port for the r
   ctl.py state                                   the state document the payload received
   ctl.py warm                                    hover the tiles so the WM re-emits every pose
   ctl.py cfg                                     print the payload's configuration
+  ctl.py trace [--reset]                         the keeper's per-decision trace (cfg trace=true)
 """
 import json
 import os
@@ -30,6 +31,7 @@ import install as I                                        # noqa: E402
 
 D = I.D
 NATURAL = D + "/natural.json"
+NATURAL_FRAMES = D + "/natural_frames.json"   # per-tile x/y/w/h at scale 1.0 (issue #3)
 LAST_RESIZE = D + "/last_resize.json"
 
 # One teach pass is a sweep over every tile plus the settle the payload's gate needs before it
@@ -70,7 +72,7 @@ def hb():
     there and the JSON parse failed silently (round 33)."""
     try:
         n = int.from_bytes(I.rd_sym("_io_hb_len", 4), "little")
-        n = max(0, min(n, 1024))
+        n = max(0, min(n, 1536))
         return json.loads(I.rd_sym("_io_hb", max(1, n))[:n].decode(errors="replace"))
     except Exception:
         return {}
@@ -88,6 +90,45 @@ def poses():
         if len(f) == 4:
             rows.append({"wid": int(f[0]), "base": int(f[1]), "mine": int(f[2]),
                          "lvl": None if f[3] == "9" else int(f[3])})
+    return rows
+
+
+def trace_dump(reset=False):
+    """The keeper's own trace of pose writes (cfg `trace=true` writes it; issue #31).
+
+    One record per keeper decision for a strip window, with every gate value that decided it, so
+    "was that pose a hover lift or a layout write" is read from the WM's own stream instead of
+    inferred from a width ratio.  The ring is written only when `trace` is on; the payload never
+    reads it back, so it cannot influence a decision.
+
+    Format (one line per record):
+        <seq> w=<wid> m0=<scale> m4=<row1col0> x=<m12> y=<m13> b0=<base m0|-1>
+              rw=<drawn width|-1> o=<drawn> u=<ours> b=<has base> T=<teach-legal>
+              r=<retract> a=<not in rail_now> c=<candidate held> h=<hold ms> q=<ticks> sm=<scale>
+
+    The bytes after the write cursor are the previous wrap; records are sorted by `seq` here, so a
+    reader always sees the last ring in order.  `--reset` zeroes the ring and its counters.
+    """
+    try:
+        n = int.from_bytes(I.rd_sym("_io_tr_len", 4), "little")
+        n = max(0, min(n, 16384))
+        raw = I.rd_sym("_io_tr", max(1, n))[:n].decode(errors="replace") if n else ""
+    except Exception:
+        return []
+    rows = []
+    for line in raw.replace("\x00", "\n").split("\n"):
+        if " w=" in line and line.split(" ", 1)[0].isdigit():
+            rows.append(line.strip())
+    rows.sort(key=lambda l: int(l.split(" ", 1)[0]))
+    if reset:
+        try:
+            st = json.load(open(I.STATE))
+            I.wrmem(st["addr"] + st["syms"]["_io_tr_pos"], b"\0\0\0\0")
+            I.wrmem(st["addr"] + st["syms"]["_io_tr_len"], b"\0\0\0\0")
+            I.wrmem(st["addr"] + st["syms"]["_io_tr_seq"], b"\0\0\0\0")
+            I.wrmem(st["addr"] + st["syms"]["_io_tr"], b"\0" * 16384)
+        except Exception:
+            pass
     return rows
 
 
@@ -147,6 +188,20 @@ def natural():
     return {str(k): v for k, v in (d or {}).items() if isinstance(v, (int, float))}
 
 
+def natural_frames():
+    """The resting frame of every tile at scale 1.0, recorded by the teach pass (issue #3).
+
+    Width alone cannot see a pivot error: scaling about the wrong point leaves every width ratio
+    correct and moves the tiles.  So the teach pass records x/y as well, and `resize 1.0` compares
+    against them -- an x/y that does not come back is a loud failure, not a quiet drift."""
+    try:
+        with open(NATURAL_FRAMES) as f:
+            d = json.load(f)
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
 # ---------------------------------------------------------------- teach (issue #17)
 def teach_reason(tiles, nat, rows):
     """Why a teach pass is required before a resize can be trusted, or None when it is not.
@@ -168,6 +223,34 @@ def teach_reason(tiles, nat, rows):
     return None
 
 
+def wait_bases(ids, timeout=TEACH_SETTLE, sweep=None, poll=0.1, resweep=0.6):
+    """Bounded wait for the keeper's *settled* flags (issue #4), instead of a fixed sleep.
+
+    The payload promotes a base when SETTLE_TICKS state documents have arrived with no newer write
+    for that window; that is observable here as `poses()` reporting `base: 1` for the tile.  The
+    payload has no timer -- it runs only when WindowManager calls a patched function -- and the
+    last tile of a sweep has no later write to promote it, so while any tile is still missing this
+    gives the payload a call with one measurement pass.  `timeout` (the old fixed window) is now
+    only a ceiling; the normal case returns as soon as the flags are set.
+
+    Returns (missing ids, sweeps issued).
+    """
+    sweep = sweep or (lambda: wmctl().force_writes(passes=1))
+    t0 = time.time()
+    last = t0
+    sweeps = 0
+    while True:
+        have = {int(r["wid"]) for r in poses() if r.get("base")}
+        missing = [int(i) for i in ids if int(i) not in have]
+        if not missing or time.time() - t0 >= timeout:
+            return missing, sweeps
+        if time.time() - last >= resweep:
+            sweep()
+            sweeps += 1
+            last = time.time()
+        time.sleep(poll)
+
+
 def teach_now(M=None, settle=TEACH_SETTLE):
     """One teach pass: re-learn every rail tile's resting pose and re-record the natural widths
     that go with it.
@@ -175,23 +258,29 @@ def teach_now(M=None, settle=TEACH_SETTLE):
     Teaching is only allowed at scale 1.0 (the payload gates on it, because a base learned at any
     other scale bakes that scale in), so this releases any applied scale first and leaves the
     strip at 1.0; the caller applies the scale it wants afterwards.  Teaching is switched off again
-    before returning: a later sweep must not learn from a hover lift (round 34)."""
+    before returning: a later sweep must not learn from a hover lift (round 34).
+
+    The wait is `wait_bases`: the payload's own settled flag, bounded by `settle`, not a sleep."""
     M = M or wmctl()
     t0 = time.time()
     cfg_set(s=1.0, dilate=False, teach=True)
     moves = M.force_writes()
-    time.sleep(settle)
+    ids = [t["id"] for t in rail_tiles()]
+    _, sweeps = wait_bases(ids, settle) if ids else ([], 0)
     tiles = rail_tiles()
     nat = {str(t["id"]): t["w"] for t in tiles}
     if nat:
         with open(NATURAL, "w") as f:
             json.dump(nat, f, indent=1)
+        with open(NATURAL_FRAMES, "w") as f:
+            json.dump({str(t["id"]): {"x": t["x"], "y": t["y"], "w": t["w"], "h": t["h"]}
+                       for t in tiles}, f, indent=1)
     cfg_set(teach=False)
     have = {int(r["wid"]) for r in poses() if r.get("base")}
     nobase = [int(i) for i in nat if int(i) not in have]
-    return {"ok": bool(nat) and not nobase, "moves": moves, "tiles": len(nat),
+    return {"ok": bool(nat) and not nobase, "moves": max(moves, 0), "tiles": len(nat),
             "bases": len(nat) - len(nobase), "no_base": nobase,
-            "secs": round(time.time() - t0, 2)}
+            "waits": sweeps, "secs": round(time.time() - t0, 2)}
 
 
 # ---------------------------------------------------------------- resize
@@ -234,7 +323,11 @@ def apply_scale(s, tries=None, teach=False):
     # WM restores from its own copy without going through the keeper hook, so a base learned from a
     # lift renders `1.5 x lift` (measured 1.505-1.746).  The base is taught by the strip's own
     # reveal/layout writes, before any pointer input.
-    c = cfg_set(s=s, dilate=abs(s - 1.0) > 1e-9, qx=16.0, qy=490.0, teach=False)
+    #
+    # No pivot is written (issue #3): the payload derives it from the document's own rail frames
+    # (leftmost drawn tile x, vertical centre of the drawn tiles).  A debugging session can still
+    # pin it with `cfg '{"pivot_fixed":true,"qx":…,"qy":…}'`.
+    c = cfg_set(s=s, dilate=abs(s - 1.0) > 1e-9, teach=False)
     rep = {"s": s, "gen": c["gen"], "tries": 0, "tiles": [], "ok": False,
            "teach": {"needed": bool(why), "reason": why, "passes": 1 if why else 0,
                      "secs": (taught or {}).get("secs", 0.0)}}
@@ -242,7 +335,8 @@ def apply_scale(s, tries=None, teach=False):
         M.force_writes(passes=1)     # measurement only: every tile written once (see wmctl.py)
         time.sleep(0.35)
         rep["tries"] = i + 1
-        rep["tiles"] = [{"id": t["id"], "owner": t["owner"], "w": t["w"],
+        rep["tiles"] = [{"id": t["id"], "owner": t["owner"], "x": t.get("x"), "y": t.get("y"),
+                         "w": t["w"], "h": t.get("h"),
                          "natural": nat.get(str(t["id"])),
                          "ratio": round(t["w"] / nat[str(t["id"])], 3)
                          if str(t["id"]) in nat else None}
@@ -251,8 +345,26 @@ def apply_scale(s, tries=None, teach=False):
         rep["ok"] = bool(got) and all(abs(t["ratio"] - s) <= 0.06 for t in got)
         if rep["ok"]:
             break
+    # Issue #3: width alone cannot see a pivot error.  At 1.0 the tile must also be back at the
+    # x/y the teach pass recorded; an error here is the quiet "tiles drift" failure made loud.
+    rep["xy"] = {"checked": False, "ok": None, "moved": []}
+    if abs(s - 1.0) < 1e-9:
+        fr = natural_frames()
+        if fr:
+            moved = []
+            for t in rep["tiles"]:
+                f = fr.get(str(t["id"]))
+                if not f or t["x"] is None or t["y"] is None:
+                    continue
+                dx, dy = t["x"] - f["x"], t["y"] - f["y"]
+                if abs(dx) > 1 or abs(dy) > 1:
+                    moved.append({"id": t["id"], "dx": dx, "dy": dy})
+            rep["xy"] = {"checked": True, "ok": not moved, "moved": moved}
+            if moved:
+                rep["ok"] = False
     cfg_set(teach=True)          # the next layout write may teach the resting pose again
-    rep["hb"] = {k: hb().get(k) for k in ("strip", "apply", "dil")}
+    rep["hb"] = {k: hb().get(k) for k in ("strip", "apply", "dil", "px", "py", "psrc",
+                                          "railchg", "unsettled", "pivmiss")}
     rep["secs"] = round(time.time() - t0, 2)
     with open(LAST_RESIZE, "w") as f:
         json.dump(rep, f, indent=1)
@@ -494,5 +606,9 @@ if __name__ == "__main__":
         M = wmctl(); print(json.dumps({"sweeps": M.force_writes(), "hb": hb()}, indent=1))
     elif cmd == "cfg":
         print(json.dumps(cfg_get(), indent=1))
+    elif cmd == "trace":
+        for line in trace_dump(reset="--reset" in a):
+            print(line)
     else:
-        raise SystemExit("usage: ctl.py move|resize|teach|selfcheck|level|measure|warm|cfg")
+        raise SystemExit("usage: ctl.py move|resize|teach|selfcheck|level|measure|warm|state|"
+                         "poses|cfg|trace")
