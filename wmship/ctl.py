@@ -156,8 +156,17 @@ def state_doc():
         d = json.loads(txt)
     except Exception:
         d = None
+    # Issue #45: the keeper's document request and the helper's ack.  `ack < req` means a keeper
+    # call asked for a re-read that the helper has not served yet, which is the only state in
+    # which a teach/replay decision is deferred.
+    try:
+        req = int.from_bytes(I.rd_sym("_io_st_req", 4), "little")
+        ack = int.from_bytes(I.rd_sym("_io_st_ack", 4), "little")
+    except Exception:
+        req = ack = None
     return {"len": n, "gen": g1, "complete": txt.rstrip().endswith("}"),
             "parsed": d is not None,
+            "st_req": req, "st_ack": ack,
             "flush": (d or {}).get("flush"), "has_flush": "flush" in (d or {}),
             "rail_now": (d or {}).get("rail_now"), "has_rail_now": "rail_now" in (d or {}),
             "strip_on": (d or {}).get("strip_on"), "has_strip_on": "strip_on" in (d or {}),
