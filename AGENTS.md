@@ -6,7 +6,14 @@ Working notes for this repository. Read this before changing code.
 
 | path | what it is |
 |---|---|
-| `companion/` | the SwiftUI menu-bar app; owns no privilege, drives the CLI |
+| `Package.swift` | SwiftPM manifest: the `Sturgeon` executable and the `SturgeonKit` library |
+| `Sources/Sturgeon/` | the SwiftUI menu-bar shell: status item, popover, view model; owns no privilege, drives the CLI |
+| `Sources/SturgeonKit/` | the non-UI core: tool-tree paths, process runner, exact command vectors, JSON decoding |
+| `Tests/SturgeonKitTests/` | path, decoding and command-vector tests; need no root and no WindowManager |
+| `Resources/` | `Info.plist` and `AppIcon.icns`, installed into the bundle by `scripts/build-app.sh` |
+| `scripts/` | `build-helpers.sh` (helper binaries), `build-app.sh` (the bundle), `package.sh` (entry point) |
+| `pack/` | release signing, notarization, stapling and the casks |
+| `tools/` | proof helper `axui` and the icon generator |
 | `wmship.sh` | the user-facing tool entry point (`start`, `stop`, `status`, `doctor`, `resize`, …) |
 | `wmship/` | installer, capability CLI, payload source, daemon, build scripts |
 | `wmlocate.py` | resolves the patch sites from binary content |
@@ -17,8 +24,11 @@ Working notes for this repository. Read this before changing code.
 ## Build
 
 ```sh
-cd wmship && ./build.sh          # payload image (clang from the command line tools)
-cd companion && ./build.sh       # app bundle
+./scripts/build-helpers.sh       # helper binaries (clang/swiftc from the command line tools)
+( cd wmship && ./build.sh )      # payload image
+swift build -c release           # the app executable
+swift test                       # the package tests (no root, no WindowManager)
+./scripts/build-app.sh           # assemble dist/Sturgeon.app from .build + Resources + the tool tree
 ./scripts/package.sh             # app + tool, signed and packaged (ad-hoc by default)
 ```
 
@@ -98,7 +108,7 @@ When a new build appears:
 
 ## Release
 
-1. Bump `CFBundleShortVersionString` and `CFBundleVersion` in `companion/Info.plist`.
+1. Bump `CFBundleShortVersionString` and `CFBundleVersion` in `Resources/Info.plist`.
 2. Run the **Release** workflow with that version; it refuses a mismatch.
 3. The workflow signs with Developer ID, notarizes, staples, publishes the zip and its sha256, and
    opens a PR against the tap with the updated cask.

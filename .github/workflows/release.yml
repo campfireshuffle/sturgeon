@@ -58,6 +58,10 @@ jobs:
           fi
           echo "version=$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Test the package
+        shell: bash
+        run: swift test
+
       - name: Build the helpers and the payload
         shell: bash
         run: |

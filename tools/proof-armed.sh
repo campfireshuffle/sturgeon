@@ -17,9 +17,9 @@
 # the mouse: all control is AXPress / AXValue on the app itself, and the resize sweep is the
 # shipped `wmship.sh resize` command the app invokes.
 set -u
-W=${0:A:h:h:h}
+W=${0:A:h:h}
 OUT=$W/re/round35-sturgeon
-AX=$W/companion/tools/axui
+AX=$W/tools/axui
 PID=${1:?usage: proof-armed.sh <app-pid>}
 mkdir -p $OUT
 NOTES=$OUT/proof-notes.txt

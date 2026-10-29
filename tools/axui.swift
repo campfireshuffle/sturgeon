@@ -8,7 +8,7 @@
 //   axui <pid> dec <identifier> [n]   AXDecrement
 //   axui <pid> menuitem <title>       press the menu item with that title (anywhere in the app)
 //
-// Built by work/companion/tools/build-tools.sh.  AX only: this is the inspection path the task
+// Built by tools/build-tools.sh.  AX only: this is the inspection path the task
 // allows (no synthetic clicks or drags anywhere).
 import Cocoa
 import ApplicationServices

@@ -4,12 +4,12 @@
 #
 #   ./pack/package.sh [version] [build]
 #
-# The app itself is owned by the UI worker: when work/companion/package.sh exists this script runs
-# it and post-processes its bundle (it injects `a/stagepilot`, the icon and the Swift binary).  This
-# script then owns everything a release needs and a dev build does not:
+# The app is built by scripts/build-app.sh (SwiftPM + Resources/ + the tool tree), which leaves
+# dist/Sturgeon.app. This script post-processes that bundle (assembled tool tree included) and owns
+# everything a release needs and a dev build does not:
 #
-#   * inside-out signing of every Mach-O, with com.apple.security.cs.debugger on the three
-#     task_for_pid callers (pack/wmx.entitlements) — hardened runtime + timestamp
+#   * inside-out signing of every Mach-O — hardened runtime + timestamp, no entitlements (root with
+#     SIP off already has task_for_pid against WindowManager; see AGENTS.md)
 #   * notarization (notarytool --wait), stapling, and an spctl assessment of the stapled bundle
 #   * the artifact name: art/sturgeon-<version>-macos-arm64.zip, zipped AFTER stapling, with the
 #     sha256 taken from that zip (a cask sha of a pre-staple zip is a lie)
@@ -33,7 +33,6 @@ APPNAME=Sturgeon
 VERSION=${1:-1.0.0}
 BUILD=${2:-35}
 ZIP=$ART/sturgeon-$VERSION-macos-arm64.zip
-ENT=$PACK/wmx.entitlements
 CASK_IN=$WORK/homebrew/Casks/sturgeon.rb.in
 CASK_OUT=$WORK/homebrew/Casks/sturgeon.rb
 CASK_LOCAL=$WORK/homebrew/Casks/sturgeon-local.rb
@@ -85,29 +84,28 @@ notary_ready() {
 mkdir -p $ART
 rm -rf $ART/$APPNAME.app $ZIP $ZIP.sha256
 
-# ---------------------------------------------------------------- 1. the app (UI worker or stub)
-if [[ -x $WORK/companion/package.sh ]]; then
-  say "app: work/companion/package.sh (the UI worker's bundle)"
-  ( cd $WORK/companion && SIGN_IDENTITY="$SIGN_IDENTITY" ./package.sh "$VERSION" "$BUILD" ) \
-    || { say "companion/package.sh failed" >&2; exit 1; }
-  [[ -d $WORK/dist/$APPNAME.app ]] || { say "companion produced no dist/$APPNAME.app" >&2; exit 1; }
-  /usr/bin/ditto $WORK/dist/$APPNAME.app $ART/$APPNAME.app
-else
-  say "app: stub shell (no work/companion/package.sh)"
-  APP=$ART/$APPNAME.app
-  mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
-  cat > $APP/Contents/MacOS/$APPNAME <<'STUB'
-#!/bin/zsh
-# Sturgeon — stub shell.  A UI build replaces this executable; the CLI surface underneath is the
-# one in ../Resources/wmship, so the packaging proof exercises the same code either way.
-R=$(cd "$(dirname "$0")/../Resources/wmship" && pwd -P)
-exec "$R/wmship.sh" "$@"
-STUB
-  chmod 0755 $APP/Contents/MacOS/$APPNAME
-  cp $PACK/Info.plist $APP/Contents/Info.plist
-fi
+# ---------------------------------------------------------------- 1. the app
+say "app: scripts/build-app.sh (SwiftPM)"
+( cd $WORK && SIGN_IDENTITY="$SIGN_IDENTITY" ./scripts/build-app.sh "$VERSION" "$BUILD" ) \
+  || { say "scripts/build-app.sh failed" >&2; exit 1; }
+[[ -d $WORK/dist/$APPNAME.app ]] || { say "build-app.sh produced no dist/$APPNAME.app" >&2; exit 1; }
+/usr/bin/ditto $WORK/dist/$APPNAME.app $ART/$APPNAME.app
 APP=$ART/$APPNAME.app
 T=$APP/Contents/Resources/wmship
+
+# ---------------------------------------------------------------- 1b. the dev artifacts
+# ./scripts/package.sh has always left a runnable bundle, a zip and a cask in dist/ — the local
+# install proof reads them. The release artifact is the stapled zip in art/.
+[[ -f $CASK_IN ]] || { say "missing $CASK_IN" >&2; exit 1; }
+DEVZIP=$WORK/dist/$APPNAME-$VERSION.zip
+rm -f $DEVZIP $DEVZIP.sha256
+/usr/bin/ditto -c -k --sequesterRsrc --keepParent $WORK/dist/$APPNAME.app $DEVZIP
+DEV_SHA=$(shasum -a 256 $DEVZIP | cut -d' ' -f1)
+print -r -- "$DEV_SHA  $DEVZIP" > $DEVZIP.sha256
+sed -e "s|@@VERSION@@|$VERSION|g" -e "s|@@SHA256@@|$DEV_SHA|g" \
+    -e "s|@@URL@@|file://$DEVZIP|g" $CASK_IN > $WORK/dist/sturgeon.rb
+say "dist zip: $DEVZIP"
+say "dist cask: $WORK/dist/sturgeon.rb"
 
 # ---------------------------------------------------------------- 2. contract check
 for f in BUNDLE wmship.sh wmlayout.py setup.sh teardown.sh wmlocate.py \
@@ -130,10 +128,8 @@ print -r -- "{\"version\":\"$VERSION\",\"build\":\"$BUILD\"}" > $APP/Contents/Re
 say "version.json: $(cat $APP/Contents/Resources/version.json)"
 
 # ---------------------------------------------------------------- 4. sign, inside out
-for b in $T/bin/wmx $T/wmship/wmhb $T/wmship/wmcls; do
-  sign_one "$b" "$ENT"
-done
-for b in $T/bin/r19ax $T/bin/r8state $T/bin/r21probe $T/bin/r21move $T/bin/r21scroll \
+for b in $T/bin/wmx $T/wmship/wmhb $T/wmship/wmcls \
+         $T/bin/r19ax $T/bin/r8state $T/bin/r21probe $T/bin/r21move $T/bin/r21scroll \
          $T/bin/r21gesture $T/bin/r21obs $T/bin/r20click $T/a/stagepilot \
          $T/wm/wmobs $T/wm/wmkey $APP/Contents/MacOS/$APPNAME; do
   [[ -e $b ]] && sign_one "$b"
@@ -142,10 +138,7 @@ sign_one "$APP"
 codesign --verify --deep --strict --verbose=2 $APP >/dev/null 2>&1 \
   && say "signature: verifies (deep, strict)" || { say "REFUSING: signature does not verify" >&2; exit 1; }
 if [[ $DISTRIBUTABLE == 1 ]]; then
-  say "task-port entitlements:"
-  for b in $T/bin/wmx $T/wmship/wmhb $T/wmship/wmcls; do
-    print -r -- "  ${b#$APP/} $(codesign -d --entitlements - "$b" 2>/dev/null | grep -o 'com.apple.security.cs.debugger' | head -1)"
-  done
+  say "entitlements: none (root + SIP off is sufficient for the task port)"
 fi
 
 # ---------------------------------------------------------------- 5. notarize + staple

@@ -1,5 +1,7 @@
 import AppKit
+import Combine
 import Foundation
+import SturgeonKit
 
 /// Everything the popover renders.  All mutation of @Published state happens on the main thread;
 /// the Backend queue only ever produces values.
@@ -80,7 +82,7 @@ final class PilotModel: ObservableObject {
     }
 
     private func apply(status r: RunResult, debuggerFallback: String = "none") {
-        guard let j = r.json else {
+        guard let report = r.decode(StatusReport.self) else {
             // no root, or the JSON command could not run at all
             let msg = Self.lastLine(r.combined)
             if r.err.lowercased().contains("password is required")
@@ -100,24 +102,20 @@ final class PilotModel: ObservableObject {
             return
         }
         setupNeeded = false
-        if let b = j["build"] as? String, !b.isEmpty { build = b } else { build = wmBuildFallback }
-        pid = (j["pid"] as? Int) ?? wmPidFallback
-        armed = (j["state"] as? String) == "ARMED"
-        sitesTotal = (j["sites_total"] as? Int) ?? 6
-        sitesPatched = (j["sites_patched"] as? Int) ?? 0
-        debugger = (j["debugger"] as? String) ?? debuggerFallback
-        reason = j["reason"] as? String
-        helper = (j["helper"] as? [String])?.first ?? "none"
-        if let d = j["daemon"] as? [String: Any] {
-            daemonLoaded = (d["loaded"] as? Bool) ?? false
-        }
-        if let caps = j["caps"] as? [String: Any] {
-            births = (caps["births"] as? Bool) ?? false
-            let replay = (caps["replay"] as? Bool) ?? false
-            let levels = (caps["levels"] as? Bool) ?? false
-            onTop = replay && levels
-            level3 = ((caps["level_manual"] as? Int) ?? 0) == 3
-            if !isEditingScale, let s = caps["s"] as? Double { scale = s }
+        build = report.build ?? wmBuildFallback
+        pid = report.pid ?? wmPidFallback
+        armed = report.isArmed
+        sitesTotal = report.sitesTotal
+        sitesPatched = report.sitesPatched
+        debugger = report.debugger ?? debuggerFallback
+        reason = report.reason
+        helper = report.helper.first ?? "none"
+        daemonLoaded = report.daemon.loaded
+        if let caps = report.caps {
+            births = caps.births
+            onTop = caps.replay && caps.levels
+            level3 = caps.levelManual == 3
+            if !isEditingScale, let s = caps.scale { scale = s }
         } else if !armed {
             births = false
             onTop = false
@@ -132,40 +130,7 @@ final class PilotModel: ObservableObject {
         Backend.queue.async {
             let r = Backend.doctor()
             DispatchQueue.main.async {
-                if let j = r.json {
-                    let ok = (j["ok"] as? Bool) ?? false
-                    if let b = j["build"] as? String, !b.isEmpty { self.build = b }
-                    let checks = (j["checks"] as? [[String: Any]]) ?? []
-                    let failed = checks.filter { ($0["ok"] as? Bool) == false }
-                    let names = failed.compactMap { $0["check"] as? String }
-                    // `doctor` validates a *pristine* WindowManager by design, so while armed it
-                    // must fail the six byte-equality checks that are our own patch.  Those (and
-                    // only those) are expected: the arm gate itself already passed.
-                    let patchedOnly = !names.isEmpty && names.allSatisfy {
-                        $0.hasSuffix(".file-eq-live") || $0.hasSuffix(".keeper-prologue")
-                    }
-                    if ok {
-                        self.doctorOK = true
-                        self.doctorLine = "PASS"
-                        self.doctorRefusal = nil
-                    } else if self.armed && patchedOnly {
-                        self.doctorOK = true
-                        self.doctorLine = "PASS (armed — live bytes carry the patch)"
-                        self.doctorRefusal = nil
-                    } else {
-                        self.doctorOK = false
-                        self.doctorLine = "FAIL"
-                        let refusals = (j["refusals"] as? [String]) ?? []
-                        if let first = refusals.first {
-                            self.doctorRefusal = first
-                        } else if let bad = failed.first {
-                            self.doctorRefusal = "\(bad["check"] ?? "check"): \(bad["detail"] ?? "")"
-                        } else {
-                            self.doctorRefusal = "doctor refused"
-                        }
-                        self.footer = "doctor: " + (self.doctorRefusal ?? "FAIL")
-                    }
-                } else {
+                guard let report = r.decode(DoctorReport.self) else {
                     self.doctorOK = false
                     self.doctorLine = "unavailable"
                     let text = r.combined
@@ -176,6 +141,35 @@ final class PilotModel: ObservableObject {
                         self.doctorRefusal = Self.lastLine(text)
                         self.footer = "doctor: " + Self.lastLine(text)
                     }
+                    return
+                }
+                if let b = report.build { self.build = b }
+                let failed = report.failedChecks
+                // `doctor` validates a *pristine* WindowManager by design, so while armed it
+                // must fail the six byte-equality checks that are our own patch.  Those (and
+                // only those) are expected: the arm gate itself already passed.
+                let patchedOnly = !failed.isEmpty && failed.allSatisfy {
+                    $0.check.hasSuffix(".file-eq-live") || $0.check.hasSuffix(".keeper-prologue")
+                }
+                if report.ok {
+                    self.doctorOK = true
+                    self.doctorLine = "PASS"
+                    self.doctorRefusal = nil
+                } else if self.armed && patchedOnly {
+                    self.doctorOK = true
+                    self.doctorLine = "PASS (armed — live bytes carry the patch)"
+                    self.doctorRefusal = nil
+                } else {
+                    self.doctorOK = false
+                    self.doctorLine = "FAIL"
+                    if let first = report.refusals.first {
+                        self.doctorRefusal = first
+                    } else if let bad = failed.first {
+                        self.doctorRefusal = "\(bad.check): \(bad.detail)"
+                    } else {
+                        self.doctorRefusal = "doctor refused"
+                    }
+                    self.footer = "doctor: " + (self.doctorRefusal ?? "FAIL")
                 }
             }
         }
@@ -185,38 +179,38 @@ final class PilotModel: ObservableObject {
 
     func setBirths(_ v: Bool) {
         births = v
-        writeCfg(["births": v], label: "births=\(v)")
+        writeConfig(.births(v))
     }
 
     /// One toggle, both keys: replay (the keeper re-emits the pose set) and levels.
     func setOnTop(_ v: Bool) {
         onTop = v
-        writeCfg(["replay": v, "levels": v], label: "replay=\(v) levels=\(v)")
+        writeConfig(.onTop(v))
     }
 
     func setLevel3(_ v: Bool) {
         level3 = v
-        writeCfg(["level_manual": v ? 3 : 0], label: "level_manual=\(v ? 3 : 0)")
+        writeConfig(.level(v))
     }
 
-    private func writeCfg(_ changes: [String: Any], label: String) {
+    private func writeConfig(_ change: ConfigChange) {
         guard armed else {
             footer = "not armed — the payload config is not writable"
             return
         }
         busy = true
-        footer = "writing cfg \(label)…"
+        footer = "writing cfg \(change.label)…"
         Backend.queue.async {
-            var cfg = Backend.cfg() ?? [:]
-            for (k, v) in changes { cfg[k] = v }
-            let w = Backend.writeCfg(cfg)
-            let after = Backend.cfg() ?? [:]
+            var config = Backend.config() ?? PayloadConfig()
+            config.apply(change)
+            let written = Backend.writeConfig(config)
+            let after = Backend.config() ?? PayloadConfig()
             DispatchQueue.main.async {
                 self.busy = false
-                if w.code == 0 {
-                    self.footer = "cfg \(label) → written; read-back \(Self.brief(after))"
+                if written.code == 0 {
+                    self.footer = "cfg \(change.label) → written; read-back \(after.brief)"
                 } else {
-                    self.footer = "cfg \(label) → error: \(Self.lastLine(w.combined))"
+                    self.footer = "cfg \(change.label) → error: \(Self.lastLine(written.combined))"
                 }
                 self.refresh()
             }
@@ -250,20 +244,17 @@ final class PilotModel: ObservableObject {
         busy = true
         footer = "resize \(Int((s * 100).rounded()))% → sweeping…"
         Backend.queue.async {
-            let r = Backend.wmship(["resize", String(format: "%.2f", s)], timeout: 180)
+            let r = Backend.run(.resize(scale: s))
             DispatchQueue.main.async {
                 self.resizing = false
                 self.busy = false
-                if let j = r.json {
-                    let ok = (j["ok"] as? Bool) ?? false
-                    let tiles = (j["tiles"] as? [[String: Any]]) ?? []
-                    let ratios = tiles.compactMap { $0["ratio"] as? Double }
-                    if ok {
-                        self.footer = "resize \(String(format: "%.2f", s)) → ok, \(tiles.count) tiles ["
-                            + ratios.map { String(format: "%.2f", $0) }.joined(separator: " ") + "]"
+                if let report = r.decode(ResizeReport.self) {
+                    if report.ok {
+                        self.footer = "resize \(String(format: "%.2f", s)) → ok, \(report.tiles.count) tiles ["
+                            + report.ratios.map { String(format: "%.2f", $0) }.joined(separator: " ") + "]"
                     } else {
                         self.footer = "resize \(String(format: "%.2f", s)) → "
-                            + ((j["err"] as? String) ?? "failed")
+                            + (report.err ?? "failed")
                     }
                 } else {
                     self.footer = "resize → error: \(Self.lastLine(r.combined))"
@@ -280,7 +271,7 @@ final class PilotModel: ObservableObject {
         busy = true
         footer = "start → doctor, install, observers, daemon…"
         Backend.queue.async {
-            let r = Backend.wmship(["start"], timeout: 300)
+            let r = Backend.run(.start)
             let st = Backend.status()
             DispatchQueue.main.async {
                 self.busy = false
@@ -297,7 +288,7 @@ final class PilotModel: ObservableObject {
         busy = true
         footer = "stop → restoring the pristine WindowManager…"
         Backend.queue.async {
-            let r = Backend.wmship(["stop"], timeout: 240)
+            let r = Backend.run(.stop)
             let st = Backend.status()
             DispatchQueue.main.async {
                 self.busy = false
@@ -321,14 +312,14 @@ final class PilotModel: ObservableObject {
         busy = true
         footer = "move → \(stage.label)…"
         Backend.queue.async {
-            let r = Backend.wmship(["move", stage.title], timeout: 180)
+            let r = Backend.run(.move(stage: stage.title))
             DispatchQueue.main.async {
                 self.busy = false
-                if let j = r.json {
-                    if (j["ok"] as? Bool) == true {
-                        self.footer = "move → \(stage.label): ok (cgid \(j["cgid"] ?? "?"))"
+                if let report = r.decode(MoveReport.self) {
+                    if report.ok {
+                        self.footer = "move → \(stage.label): ok (cgid \(report.cgid.map(String.init) ?? "?"))"
                     } else {
-                        self.footer = "move → \(stage.label): \((j["err"] as? String) ?? "failed")"
+                        self.footer = "move → \(stage.label): \(report.err ?? "failed")"
                     }
                 } else {
                     self.footer = "move → error: \(Self.lastLine(r.combined))"
@@ -396,17 +387,6 @@ final class PilotModel: ObservableObject {
 
     static func lastLine(_ s: String) -> String {
         s.split(separator: "\n").last.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
-    }
-
-    static func brief(_ c: [String: Any]) -> String {
-        let keys = ["births", "replay", "levels", "level_manual", "s"]
-        return keys.map { k in
-            if let v = c[k] as? Bool { return "\(k)=\(v)" }
-            if let v = c[k] as? Int { return "\(k)=\(v)" }
-            if let v = c[k] as? Double { return String(format: "%@=%.2f", k, v) }
-            if let v = c[k] { return "\(k)=\(v)" }
-            return "\(k)=?"
-        }.joined(separator: " ")
     }
 
     static func appleScriptString(_ s: String) -> String {

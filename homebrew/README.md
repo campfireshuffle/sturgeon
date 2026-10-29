@@ -17,7 +17,7 @@ do not do. The cask is the only supported install path.
 
 ## Release
 
-1. Bump `CFBundleShortVersionString` and `CFBundleVersion` in `companion/Info.plist`.
+1. Bump `CFBundleShortVersionString` and `CFBundleVersion` in `Resources/Info.plist`.
 2. Run the **Release** workflow with that version.
 3. It signs and notarizes, staples, publishes the zip and its sha256, and opens a PR against the tap
    that updates the cask.

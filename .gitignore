@@ -6,6 +6,7 @@ build-*/
 *.o
 *.obj
 DerivedData/
+.build/
 .swiftpm/
 Package.resolved.bak
 
@@ -66,9 +67,11 @@ venv/
 /wm/r20win
 /wmship/wmhb
 /wmship/wmcls
-/companion/build/
 /art/
 
 # generated cask output (the template is sturgeon.rb.in; the tap is the source of truth)
 /homebrew/Casks/sturgeon.rb
 /homebrew/Casks/sturgeon-local.rb
+
+# dev helper binary built by tools/build-tools.sh
+/tools/axui

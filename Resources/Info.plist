@@ -2,8 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleDisplayName</key>
-	<string>Sturgeon</string>
 	<key>CFBundleExecutable</key>
 	<string>Sturgeon</string>
 	<key>CFBundleIdentifier</key>
@@ -12,21 +10,25 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>Sturgeon</string>
+	<key>CFBundleDisplayName</key>
+	<string>Sturgeon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0.0</string>
 	<key>CFBundleVersion</key>
 	<string>35</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
-	<key>LSMultipleInstancesProhibited</key>
-	<true/>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Not notarised. Requires SIP disabled and an admin account for setup.sh.</string>
+	<string>© 2026 Sarim Abbas. All rights reserved.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
 </dict>
 </plist>
