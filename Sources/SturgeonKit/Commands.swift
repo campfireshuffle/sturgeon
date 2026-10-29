@@ -23,6 +23,9 @@ public enum SturgeonCommand: Equatable {
     case counters
     /// `wmship.sh doctor --json`
     case doctor
+    /// `wmship.sh selfcheck` — the resize preflight (issue #5).  Needs root, measures every tile
+    /// at a probe scale and restores the strip; it deliberately does not teach.
+    case selfcheck
     /// `a/stagepilot stages`
     case stages
     /// `wmship.sh cfg`
@@ -47,6 +50,9 @@ public enum SturgeonCommand: Equatable {
         case .status, .counters, .configRead, .configWrite: return 40
         case .doctor, .stop: return 240
         case .start: return 300
+        /// Two sweeps and two settles; the issue asks for under ~10 s, the deadline is for a
+        /// slow strip, not for teaching.
+        case .selfcheck: return 120
         case .resize, .move, .moveWindow: return 180
         }
     }
@@ -87,6 +93,8 @@ public struct Toolchain {
             return try root("true", timeout: command.timeout)
         case .doctor:
             return wmship(["doctor", "--json"], timeout: command.timeout)
+        case .selfcheck:
+            return wmship(["selfcheck"], timeout: command.timeout)
         case .configRead:
             return wmship(["cfg"], timeout: command.timeout)
         case .start:

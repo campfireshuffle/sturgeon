@@ -161,7 +161,7 @@ struct ContentView: View {
                            model.isEditingScale = editing
                            if !editing { model.applyScale(model.scale) }
                        })
-                .disabled(!model.armed || model.busy)
+                .disabled(!model.preflight.sliderEnabled || model.busy)
                 .accessibilityIdentifier("scaleSlider")
                 Text(pct)
                     .font(.system(size: 11).monospacedDigit())
@@ -169,15 +169,63 @@ struct ContentView: View {
                     .frame(width: 38, alignment: .trailing)
                     .accessibilityIdentifier("scaleReadout")
             }
+            preflightRow
             HStack {
                 Button("Reset to 100%") { model.resetScale() }
                     .buttonStyle(.link)
                     .font(.system(size: 11))
-                    .disabled(!model.armed || model.busy)
+                    .disabled(!model.preflight.sliderEnabled || model.busy)
                     .accessibilityIdentifier("resetButton")
                 Spacer()
             }
         }
+    }
+
+    // MARK: - the resize preflight (issue #5)
+
+    /// The gate's own line, plus the only two controls it offers: Retry after a refusal, and the
+    /// `teach` hint.  While the probe runs there is a spinner, not a frozen row: the strip is
+    /// visibly scaling to the probe and back at the same time.
+    private var preflightRow: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Circle()
+                    .fill(preflightColor)
+                    .frame(width: 7, height: 7)
+                Text(model.preflight.headline)
+                    .font(.system(size: 10))
+                    .foregroundColor(preflightColor)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(model.preflight.reason ?? model.preflight.headline)
+                    .accessibilityIdentifier("preflightLine")
+                Spacer(minLength: 4)
+                if model.preflight.isChecking {
+                    ProgressView().controlSize(.small)
+                } else if model.preflight.checkEnabled {
+                    Button(model.preflight.retryOffered ? "Retry" : "Check") {
+                        model.runSelfcheck()
+                    }
+                    .buttonStyle(.link)
+                    .font(.system(size: 10))
+                    .disabled(model.busy)
+                    .accessibilityIdentifier("preflightCheck")
+                }
+            }
+            if model.preflight.retryOffered {
+                Text("If it keeps failing, wmship.sh teach re-learns the tile bases.")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("preflightTeachHint")
+            }
+        }
+    }
+
+    private var preflightColor: Color {
+        if model.preflight.isReady { return .green }
+        if model.preflight.retryOffered { return .orange }
+        return .secondary
     }
 
     // MARK: - actions

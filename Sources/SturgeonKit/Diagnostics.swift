@@ -32,6 +32,8 @@ public struct DiagnosticsSnapshot: Equatable {
     /// example).  Shown instead of silently falling back to the five fields in `status`.
     public var countersNote: String?
     public var resize: ResizeReport?
+    /// The resize preflight (issue #5): why the slider is — or is not — offered.
+    public var preflight: PreflightGate?
     public var lastError: String?
     public var gesture: String
     public var ambiguousDrops: Int
@@ -47,6 +49,7 @@ public struct DiagnosticsSnapshot: Equatable {
                 counters: CountersReport? = nil,
                 countersNote: String? = nil,
                 resize: ResizeReport? = nil,
+                preflight: PreflightGate? = nil,
                 lastError: String? = nil,
                 gesture: String = "off",
                 ambiguousDrops: Int = 0,
@@ -60,6 +63,7 @@ public struct DiagnosticsSnapshot: Equatable {
         self.counters = counters
         self.countersNote = countersNote
         self.resize = resize
+        self.preflight = preflight
         self.lastError = lastError
         self.gesture = gesture
         self.ambiguousDrops = ambiguousDrops
@@ -141,6 +145,18 @@ public struct DiagnosticsSnapshot: Equatable {
             }
         } else {
             lines.append("last-resize none")
+        }
+
+        // The preflight is what decides whether the slider is offered, so a bug report without
+        // its verdict would omit the state the user is actually complaining about.
+        if let preflight {
+            lines.append("preflight \(preflight.summary)")
+            if let report = preflight.lastReport, let probe = report.probeScale {
+                lines.append("preflight-evidence probe=\(String(format: "%.2f", probe)) "
+                             + "tiles=\(report.tiles.count) off=\(report.offendingTiles.count)")
+            }
+        } else {
+            lines.append("preflight not run")
         }
 
         if let lastError, !lastError.isEmpty {

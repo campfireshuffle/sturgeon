@@ -208,6 +208,22 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertFalse(block.contains("trace on"))
     }
 
+    func testPreflightVerdictAndReasonAreInTheBlock() throws {
+        var gate = PreflightGate(armed: true)
+        gate.beginCheck()
+        let report = try XCTUnwrap(RunResult(out: """
+        {"ok": false, "s": 1.0, "probe_s": 1.2, "tol": 0.02, "restored": [],
+         "tiles": [{"id": 59, "natural": 120, "w": 151, "ratio": 1.258, "want": 1.2}],
+         "err": "tile 59 measures 1.258 x natural at probe 1.20, want 1.20 ± 0.02 (1 of 1 off)"}
+        """).decode(SelfcheckReport.self))
+        gate.finishCheck(report)
+
+        let block = DiagnosticsSnapshot(status: nil, preflight: gate, armed: true).block()
+        XCTAssertTrue(block.contains("preflight blocked — tile 59 measures 1.258"))
+        XCTAssertTrue(block.contains("preflight-evidence probe=1.20 tiles=1 off=1"))
+        XCTAssertFalse(block.contains("/Users/"))
+    }
+
     func testCountersRefusalIsVisibleInsteadOfSilentDashes() throws {
         let status = try XCTUnwrap(RunResult(out: statusJSON).decode(StatusReport.self))
         let snap = DiagnosticsSnapshot(

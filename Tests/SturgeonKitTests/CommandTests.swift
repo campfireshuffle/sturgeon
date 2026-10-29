@@ -120,6 +120,10 @@ final class CommandTests: XCTestCase {
     func testDoctorConfigReadStartStop() throws {
         XCTAssertEqual(try invocation(.doctor).arguments, ["doctor", "--json"])
         XCTAssertEqual(try invocation(.doctor).timeout, 240)
+        XCTAssertEqual(try invocation(.selfcheck).arguments, ["selfcheck"])
+        XCTAssertEqual(try invocation(.selfcheck).timeout, 120)
+        XCTAssertEqual(try invocation(.selfcheck).executable.path,
+                       root.appendingPathComponent("wmship.sh").path)
         XCTAssertEqual(try invocation(.configRead).arguments, ["cfg"])
         XCTAssertEqual(try invocation(.configRead).timeout, 40)
         XCTAssertEqual(try invocation(.start).arguments, ["start"])

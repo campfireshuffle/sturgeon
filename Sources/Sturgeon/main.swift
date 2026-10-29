@@ -48,7 +48,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let b = item.button else { return }
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
-        model.refresh(doctor: false, stages: true)
+        // The preflight runs where the slider is offered, against a fresh status document.
+        model.popoverOpened()
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.model.refresh()
