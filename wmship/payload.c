@@ -237,11 +237,13 @@ struct globals {
     double t_out_since;    // when the document last said the strip is out (candidate validity floor)
     u64 n_rdv, n_cfg, n_birth_call, n_birth_empty, n_desc_try;
     u64 n_desc_ok, n_desc_bad, n_ret, n_rej;
+    u64 n_pdwait;          // attempts deferred because no young CGWindowID was published yet
     long rdv_ms, rdv_ms_max;
     u64 last_inject_wid, last_inject_cgid, last_ser;
     double t_last_inject, t_rdv;
     int busy;
     u32 cfg_seen, st_seen, rq_seen, ids_seen;
+    u32 rdv_cg;            // the candidate the last rendezvous was spent on (one per candidate)
     u64 calls_at_site[4];
     char arrp[8][0x350];
     struct pose pose[MAXP];
@@ -362,6 +364,7 @@ static void hb_write(void) {
     p = key64(o, p, "drv", G.n_drv);        o[p++] = ',';
     p = key64(o, p, "cmp", G.n_cmp);        o[p++] = ',';
     p = key64(o, p, "miss", G.n_miss);      o[p++] = ',';
+    p = key64(o, p, "pdwait", G.n_pdwait);  o[p++] = ',';
     p = key64(o, p, "gen", (u64)G.gen);     o[p++] = ',';
     p = key64(o, p, "gen_applied", (u64)G.gen_applied); o[p++] = ',';
     p = key64(o, p, "s_milli", (u64)(G.s * 1000.0 + 0.5)); o[p++] = ',';
@@ -967,6 +970,119 @@ static int sys_desc(const char *d) {
     return 0;
 }
 
+// The *cheap* half of the identity: does io_pd already publish a window young enough to be the
+// newborn, and not already placed?  One 1 KiB page snapshot — no census, no rendezvous, nothing
+// that stops WindowManager.  It decides only whether an attempt is worth making; it never
+// chooses a window.
+static int fresh_candidate(void) {
+    double t = now();
+    const char *q = snap(B_pd, io_pd, io_pd_len, sizeof(B_pd));
+    while (*q) {
+        u32 cg = 0; int any = 0;
+        while (*q >= '0' && *q <= '9') { cg = cg * 10 + (u32)(*q++ - '0'); any = 1; }
+        while (*q == ' ') q++;
+        double ts = 0;
+        while (*q >= '0' && *q <= '9') ts = ts * 10 + (double)(*q++ - '0');
+        if (*q == '.') { q++; double f = 0.1; while (*q >= '0' && *q <= '9') { ts += (double)(*q++ - '0') * f; f *= 0.1; } }
+        while (*q && *q != '\n') q++;
+        if (*q == '\n') q++;
+        if (any && cg && !done_cgid(cg) && t - ts <= BIRTH_MAX_AGE) return 1;
+    }
+    return 0;
+}
+
+// (1)+(2)+(3) of the shipped identity, decided from buffers the helper has already published:
+// the newest young CGWindowID that is not placed, its serial from the WM's own WindowIDTable, and
+// a live WindowID object with that serial.  Returns the object to inject, or 0.
+//
+// `*need` says why 0 came back, because the two answers need different actions:
+//   0  nothing to identify            — a rendezvous cannot help;
+//   1  a young CGWindowID has no serial in the table yet;
+//   2  a serial has no live object in the census yet.
+// Both 1 and 2 mean the published buffers are from before this window existed, which is what a
+// rendezvous (one helper pass with the WM parked) fixes.
+// Which of two published CGWindowIDs is the newer window?  The observer's timestamp first; when
+// two windows first appear in the same 20 ms poll the stamps are identical, and then the larger
+// CGWindowID is the later one, because the window server allocates them from a counter that only
+// grows (measured on a multi-document launch: r40-c/r40-b/r40-seven restored at 7737.862 got
+// 9792/9791/9790, and the document the launch asked for, 83 ms later, got 9793).  Ordering by
+// this rule is what lets a launch that restores documents and then opens the requested one be
+// identified as the requested window instead of a restored one.
+static int pd_newer(double ts, u32 cg, double best_ts, u32 best_cg) {
+    if (ts != best_ts) return ts > best_ts;
+    return cg > best_cg;
+}
+
+static u64 pick_widcg(u32 *out_cg, u32 *newest_cg, int *need) {
+    *out_cg = 0; *newest_cg = 0; *need = 0;
+    u32 tgt_cg = 0; u64 tgt_ser = 0; double tgt_ts = -1.0;
+    u32 young = 0; double young_ts = -1.0;
+    const char *q = B_pd;
+    while (*q) {
+        u32 cg = 0; int any = 0;
+        while (*q >= '0' && *q <= '9') { cg = cg * 10 + (u32)(*q++ - '0'); any = 1; }
+        while (*q == ' ') q++;
+        double ts = 0;
+        while (*q >= '0' && *q <= '9') ts = ts * 10 + (double)(*q++ - '0');
+        if (*q == '.') { q++; double f = 0.1; while (*q >= '0' && *q <= '9') { ts += (double)(*q++ - '0') * f; f *= 0.1; } }
+        while (*q && *q != '\n') q++;
+        if (*q == '\n') q++;
+        if (!any || !cg || done_cgid(cg)) continue;
+        // Only act at the birth moment.  A late identify (after the WM has already surfaced the
+        // app's new stage) would be applied to *that* stage, which looks like a full-size window
+        // all by itself; BIRTH_MAX_AGE is ~7x the measured create->inject latency and still well
+        // inside the WM's placement tail.
+        if (now() - ts > BIRTH_MAX_AGE) continue;
+        if (pd_newer(ts, cg, young_ts, young)) { young_ts = ts; young = cg; }
+        // the WM's map: serial for this CGWindowID
+        u64 ser = 0;
+        if (io_widcg_len) {
+            const char *m = B_widcg;
+            while (*m) {
+                u32 c = 0, se = 0; int a2 = 0;
+                while (*m >= '0' && *m <= '9') { c = c * 10 + (u32)(*m++ - '0'); a2 = 1; }
+                while (*m == ' ') m++;
+                while (*m >= '0' && *m <= '9') { se = se * 10 + (u32)(*m++ - '0'); }
+                while (*m && *m != '\n') m++;
+                if (*m == '\n') m++;
+                if (a2 && c == cg) { ser = se; break; }
+            }
+        }
+        if (!ser) continue;
+        if (pd_newer(ts, cg, tgt_ts, tgt_cg)) { tgt_ts = ts; tgt_cg = cg; tgt_ser = ser; }
+    }
+    *newest_cg = young;
+    if (!tgt_cg) { *need = 1; return 0; }          // the window is not in the WM's table yet
+    // (3) a live WindowID object with that serial, straight out of the helper's census
+    const char *w = B_wids;
+    while (*w) {
+        u64 a = 0, s2 = 0; int any2 = 0;
+        while (*w && *w != ' ' && *w != '\n') { char c = *w; int d = -1;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            if (d < 0) break; a = (a << 4) | (u64)d; w++; any2 = 1; }
+        while (*w == ' ') w++;
+        while (*w >= '0' && *w <= '9') s2 = s2 * 10 + (u64)(*w++ - '0');
+        while (*w && *w != '\n') w++;
+        if (*w == '\n') w++;
+        if (!any2 || s2 != tgt_ser) continue;
+        if (used_wid(a) || tried_wid(a)) continue;
+        if (!is_wid(a)) continue;
+        // The WM puts a newborn in its own new stage set almost immediately, so "not a member of
+        // any set" is not a usable gate here (measured: rejecting on it made 2 of 3 births miss).
+        // Membership is logged instead; the gate is the three-way agreement above plus "never
+        // used twice".
+        if (rg_member(a)) G.n_rej++;   // diagnostic only
+        G.last_ser = tgt_ser;
+        *out_cg = tgt_cg;
+        logf("PICKCG serial=", 0, (i64)tgt_ser);
+        logf("PICKCG cgid=", 0, (i64)tgt_cg);
+        return a;
+    }
+    *need = 2;                                     // serial known, object census is stale
+    return 0;
+}
+
 // identify the newborn at the birth call.
 //
 // The census the helper runs during the rendezvous is exact: WindowManager is parked inside this
@@ -985,6 +1101,20 @@ static int sys_desc(const char *d) {
 static u64 identify(u32 *out_cg) {
     *out_cg = 0;
     double t0 = now();
+
+    // ---- round 37: an attempt is only worth making once the observer has published a window
+    // young enough to be the newborn.
+    //
+    // Measured on this machine: for a new document in an *already running* app the WM's
+    // placement burst is ~110 ms (10 driver calls) and it starts before the CGWindowID reaches
+    // CGWindowList, so the first call is always too early.  Spending the one attempt allowed per
+    // 400 ms there loses the whole burst even though the observer publishes the window *inside*
+    // it (9805: published 7871.626, burst 7871.626-7871.738, one attempt, 8 calls suppressed,
+    // the window became a strip tile).  A call that has no young CGWindowID in io_pd cannot
+    // identify anything, so it is deferred here without touching t_rdv and without a census: the
+    // attempt is still available when the data arrives.
+    if (G.widcg && !G.model_id && !fresh_candidate()) { G.n_pdwait++; G.n_miss++; return 0; }
+
     // One attempt every 400 ms, whatever the outcome.  This site is entered ~20 times for one
     // birth *and* for every unrelated empty placement call, and each attempt stops the WM while
     // the helper censuses; an earlier build that re-armed on every miss spent most of a second
@@ -992,6 +1122,42 @@ static u64 identify(u32 *out_cg) {
     if (G.t_rdv > 0 && now() - G.t_rdv < 0.40) { G.n_miss++; return 0; }
     G.t_rdv = now();
     t0 = G.t_rdv;
+
+    // ---- round 37: ask for a fresh helper pass when the published buffers cannot complete the
+    // identity yet, not merely when io_ids_gen happens to have moved.
+    //
+    // io_ids_gen is bumped by the helper's 2 s census; it says nothing about whether the table
+    // and the object census already *contain this window*.  The old rule skipped the rendezvous
+    // exactly when the census was recent — which on a short burst means the one attempt reads a
+    // table from before the newborn existed (9805: its serial reached io_widcg at 7872.85, the
+    // burst ended at 7871.74) and the window is lost.  Deciding from the data instead keeps the
+    // cost bounded: at most one rendezvous per 400 ms and at most one per candidate, because a
+    // candidate that is missing after a rendezvous will not appear later either.
+    u64 sel = 0;
+    if (G.widcg && !G.model_id) {
+        u32 newest = 0; int need = 0;
+        snap(B_pd, io_pd, io_pd_len, sizeof(B_pd));
+        snap(B_widcg, io_widcg, io_widcg_len, sizeof(B_widcg));
+        snap(B_wids, io_wids, io_wids_len, sizeof(B_wids));
+        sel = pick_widcg(out_cg, &newest, &need);
+        if (!sel && need && newest && newest != G.rdv_cg) {
+            G.rdv_cg = newest;
+            if (!rendezvous(120)) { G.n_miss++; return 0; }
+            G.ids_seen = io_ids_gen;
+            snap(B_pd, io_pd, io_pd_len, sizeof(B_pd));
+            snap(B_widcg, io_widcg, io_widcg_len, sizeof(B_widcg));
+            snap(B_wids, io_wids, io_wids_len, sizeof(B_wids));
+            sel = pick_widcg(out_cg, &newest, &need);
+        }
+        if (!sel) {
+            G.n_miss++;
+            if (need) logf("WIDCG incomplete cg=", 0, (i64)newest);
+            return 0;
+        }
+        G.n_desc_ok++;
+        return sel;
+    }
+
     if (G.ids_seen == io_ids_gen) {
         if (!rendezvous(120)) { G.n_miss++; return 0; }
     }
@@ -1022,99 +1188,6 @@ static u64 identify(u32 *out_cg) {
         }
         *out_cg = cg;
         return wid;
-    }
-
-    // ---- 1. identity from the WM's own WindowIDTable (round 30).
-    //
-    // WindowIDTable keeps `_map: [UInt32: External]` keyed by the WindowID's own `serial`; the
-    // value begins { cgWindowID: UInt32, stageID: UInt32 } (measured layout below).  The helper
-    // reads that map out of process and publishes "<cgid> <serial>" lines, plus the full set of
-    // validated WindowID objects it has seen in the last 20 s (io_wids, "addr serial").
-    //
-    // So identity is a three-way agreement, all of it data:
-    //   1. a CGWindowID the user-side observer saw *appear* in the last two seconds (io_pd),
-    //   2. the WM's own table saying that CGWindowID belongs to WindowID serial N,
-    //   3. a live WindowID object with serial N that the helper read successfully (io_wids).
-    // Nothing is dereferenced that the helper did not read first, and no message is sent.
-    if (G.widcg) {
-        snap(B_widcg, io_widcg, io_widcg_len, sizeof(B_widcg));
-        snap(B_wids, io_wids, io_wids_len, sizeof(B_wids));
-        if (!io_widcg_len || !io_pd_len) { G.n_miss++; return 0; }
-
-        // (1) the newest fresh CGWindowID from the observer, and (2) its serial from the WM
-        u32 tgt_cg = 0; u64 tgt_ser = 0; double tgt_ts = -1.0;
-        {
-            const char *q = B_pd;
-            while (*q) {
-                u32 cg = 0; int any = 0;
-                while (*q >= '0' && *q <= '9') { cg = cg * 10 + (u32)(*q++ - '0'); any = 1; }
-                while (*q == ' ') q++;
-                double ts = 0;
-                while (*q >= '0' && *q <= '9') ts = ts * 10 + (double)(*q++ - '0');
-                if (*q == '.') { q++; double f = 0.1; while (*q >= '0' && *q <= '9') { ts += (double)(*q++ - '0') * f; f *= 0.1; } }
-                while (*q && *q != '\n') q++;
-                if (*q == '\n') q++;
-                if (!any || !cg || done_cgid(cg)) continue;
-                // Only act at the birth moment.  A late identify (after the WM has already
-                // surfaced the app's new stage) would be applied to *that* stage, which looks
-                // like a full-size window all by itself; 0.6 s is ~7x the measured 60-80 ms
-                // create->inject latency and still well inside the WM's placement tail.
-                if (now() - ts > BIRTH_MAX_AGE) continue;
-                if (ts <= tgt_ts) continue;
-                // the WM's map: serial for this CGWindowID
-                u64 ser = 0;
-                {
-                    const char *m = B_widcg;
-                    while (*m) {
-                        u32 c = 0, se = 0; int a2 = 0;
-                        while (*m >= '0' && *m <= '9') { c = c * 10 + (u32)(*m++ - '0'); a2 = 1; }
-                        while (*m == ' ') m++;
-                        while (*m >= '0' && *m <= '9') { se = se * 10 + (u32)(*m++ - '0'); }
-                        while (*m && *m != '\n') m++;
-                        if (*m == '\n') m++;
-                        if (a2 && c == cg) { ser = se; break; }
-                    }
-                }
-                if (!ser) continue;
-                tgt_cg = cg; tgt_ser = ser; tgt_ts = ts;
-            }
-        }
-        if (!tgt_cg) { G.n_miss++; return 0; }
-        G.last_inject_cgid = tgt_cg;
-
-        // (3) a live WindowID object with that serial, straight out of the helper's census
-        u64 pick = 0;
-        {
-            const char *q = B_wids;
-            while (*q) {
-                u64 a = 0, ser = 0; int any = 0;
-                while (*q && *q != ' ' && *q != '\n') { char c = *q; int d = -1;
-                    if (c >= '0' && c <= '9') d = c - '0';
-                    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-                    if (d < 0) break; a = (a << 4) | (u64)d; q++; any = 1; }
-                while (*q == ' ') q++;
-                while (*q >= '0' && *q <= '9') ser = ser * 10 + (u64)(*q++ - '0');
-                while (*q && *q != '\n') q++;
-                if (*q == '\n') q++;
-                if (!any || ser != tgt_ser) continue;
-                if (used_wid(a) || tried_wid(a)) continue;
-                if (!is_wid(a)) continue;
-                // The WM puts a newborn in its own new stage set almost immediately, so "not a
-                // member of any set" is not a usable gate here (measured: rejecting on it made
-                // 2 of 3 births miss).  Membership is logged instead; the gate is the three-way
-                // agreement above plus "never used twice".
-                if (rg_member(a)) G.n_rej++;   // diagnostic only
-                pick = a;
-                break;
-            }
-        }
-        if (!pick) { G.n_miss++; logf("WIDCG noobj ser=", 0, (i64)tgt_ser); return 0; }
-        G.n_desc_ok++;
-        G.last_ser = tgt_ser;
-        *out_cg = tgt_cg;
-        logf("PICKCG serial=", 0, (i64)tgt_ser);
-        logf("PICKCG cgid=", 0, (i64)tgt_cg);
-        return pick;
     }
 
     if (G.use_desc == 2) {
