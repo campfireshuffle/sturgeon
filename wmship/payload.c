@@ -132,6 +132,12 @@ u32  io_wids_gen; u32 io_wids_len; char io_wids[8192];    // every WindowID the 
 u32  io_widcg_gen; u32 io_widcg_len; char io_widcg[8192]; // "<cgid> <serial>" from the WM's own
                                                           // WindowIDTable map (round 30)
 u32  io_rdv;  u32 io_rdv_ack;                             // census rendezvous
+// Document request (issue #45): the keeper is the event.  Every keeper call bumps io_st_req; the
+// helper re-reads the document from the observer and publishes it, then writes io_st_ack.  A
+// *promotion* (teaching) is refused while ack < req-at-entry - the document is older than the last
+// event we know about, and a stale document is worse than a late one.  Replay is not gated: it
+// acts on the last fresh document, and skipping it leaves a tile off screen.
+u32  io_st_req; u32 io_st_ack;
 u32  io_ss_len;  char io_ss[64];                          // request state: new/running/done
 u32  io_res_len; char io_res[256];                        // last result JSON
 u32  io_hb_len;  char io_hb[1536];                        // status JSON (round 3: the pivot and
@@ -1884,7 +1890,11 @@ static void promote_one_rp(struct pose *p, double t, int out) {
     G.n_rp++;
 }
 
-static void promote_bases(void) {
+// `allow` is the document/event freshness gate (issue #45): the keeper refuses to *promote* while
+// a request it issued on a previous call has not been served yet, because the document may predate
+// an event we have not seen.  The candidate is left in place; the next call that is allowed
+// promotes it.  TTL still applies, so a candidate cannot be held forever.
+static void promote_bases(int allow) {
     double t = now();
     int out = strip_out_now();
     for (int i = 0; i < MAXP; i++) {
@@ -1894,13 +1904,13 @@ static void promote_bases(void) {
             if (t - p->t_cand > CAND_TTL) {
                 p->cand_ok = 0;
                 G.n_unsettled++;
-            } else if (p->cand_ticks >= SETTLE_TICKS) {
+            } else if (allow && p->cand_ticks >= SETTLE_TICKS) {
                 promote_one(p, t, out);
             }
         }
         if (p->rpcand_ok) {
             if (t - p->t_rpcand > CAND_TTL) p->rpcand_ok = 0;
-            else if (p->rpcand_ticks >= SETTLE_TICKS) promote_one_rp(p, t, out);
+            else if (allow && p->rpcand_ticks >= SETTLE_TICKS) promote_one_rp(p, t, out);
         }
     }
 }
@@ -1926,12 +1936,23 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     read_cfg();
     read_state();
     if (now() - G.t_hb > 0.20) { G.t_hb = now(); hb_write(); }   // live gate values, ~5 Hz
+    // Issue #45: the keeper call is itself an event.  Publish a request for a fresh document; the
+    // helper re-reads the authoritative window list, publishes and acks.  `doc_current` says the
+    // request issued by the *previous* call has been served, so this decision is not made against
+    // a document older than the last event we know about.  It is deliberately not a wait: a stale
+    // keeper call defers one decision instead of stalling the WM's write.
+    u32 req0 = io_st_req;
+    int doc_current = (int)(io_st_ack - req0) >= 0;
+    io_st_req = req0 + 1;
     int fresh = G.st_ok;
+    // Replay is not gated on `doc_current`: it acts on the last *fresh* document (0.5 s rule) and
+    // skipping it for a call is how a tile is left off screen during a retract.  Teaching is the
+    // direction where a stale document is dangerous, so only promotion is deferred.
     int force = G.force && G.replay && fresh;
     int strip = in_ids(wid, G.strip_ids, G.n_strip);
     int rail = in_ids(wid, G.rail_ids, G.n_rail);
     if (!force && fresh) level_sweep(txn);      // no-op while a flush is replaying
-    if (!force && fresh) promote_bases();       // any write can settle another window's candidate
+    if (!force && fresh) promote_bases(doc_current);  // any write can settle another window's candidate
     if (!strip && !rail) return;
     double m[16];
     memcpy(m, (const void *)matp, 128);
@@ -2146,7 +2167,10 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     }
     if (G.gen != G.gen_applied) {
         G.gen_applied = G.gen;
-        promote_bases();     // settle anything pending before a base is used to scale
+        // A cfg change is a user action, not a new document event: take the document as it stands
+        // (the caller's `read_state` already required it fresh) rather than deferring the pending
+        // settle by one request round-trip.
+        promote_bases(1);    // settle anything pending before a base is used to scale
         apply_all();
     }
 }

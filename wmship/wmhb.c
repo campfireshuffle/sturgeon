@@ -26,6 +26,9 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/event.h>
+#include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <libproc.h>
@@ -46,13 +49,14 @@ enum { IO_CFG, IO_CFG_LEN, IO_CFG_GEN, IO_ST, IO_ST_LEN, IO_ST_GEN, IO_RQ, IO_RQ
        IO_RQ_GEN, IO_IDS, IO_IDS_LEN, IO_IDS_GEN, IO_PD, IO_PD_LEN, IO_PD_GEN, IO_RG,
        IO_RG_LEN, IO_RG_GEN, IO_RDV, IO_RDV_ACK, IO_HB, IO_HB_LEN, IO_LOG, IO_LOG_W,
        IO_RES, IO_RES_LEN, IO_SS, IO_SS_LEN, IO_SELF, IO_SELF_LEN, IO_MAGIC,
-       IO_WIDS, IO_WIDS_LEN, IO_WIDS_GEN, IO_WIDCG, IO_WIDCG_LEN, IO_WIDCG_GEN, IO_N };
+       IO_WIDS, IO_WIDS_LEN, IO_WIDS_GEN, IO_WIDCG, IO_WIDCG_LEN, IO_WIDCG_GEN,
+       IO_ST_REQ, IO_ST_ACK, IO_N };
 static const char *g_ioname[IO_N] = {
     "cfg", "cfg_len", "cfg_gen", "st", "st_len", "st_gen", "rq", "rq_len", "rq_gen",
     "ids", "ids_len", "ids_gen", "pd", "pd_len", "pd_gen", "rg", "rg_len", "rg_gen",
     "rdv", "rdv_ack", "hb", "hb_len", "log", "log_w", "res", "res_len", "ss", "ss_len",
     "self", "self_len", "magic", "wids", "wids_len", "wids_gen",
-    "widcg", "widcg_len", "widcg_gen" };
+    "widcg", "widcg_len", "widcg_gen", "st_req", "st_ack" };
 
 static double tt(void) {
     struct timespec ts;
@@ -560,6 +564,132 @@ static int publish_st(void) {
     return 1;
 }
 
+// ---------------------------------------------------------------- event-driven republish
+// The document is a snapshot, and the only thing that can make it newer is a new file.  A vnode
+// watch on the directory catches the observer's temp+rename; a second watch on obs.log catches the
+// birth table.  This is additive: the periodic republish below stays, because the payload's settle
+// clock counts *published documents*, and a document that stops being republished would also stop
+// advancing a candidate that has already settled.  What the watch buys is latency: a change reaches
+// the keeper in about a millisecond instead of waiting for the next helper pass.
+static int g_kq = -1, g_dirfd = -1, g_obsfd = -1;
+static ino_t g_st_ino = 0;
+static off_t g_st_size = 0;
+static struct timespec g_st_time = {0, 0};
+static int g_st_known = -1;
+static ino_t g_obs_ino = 0;
+
+static int add_watch(int fd, uint32_t fflags) {
+    if (g_kq < 0 || fd < 0) return -1;
+    struct kevent ev;
+    EV_SET(&ev, (uintptr_t)fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, fflags, 0, NULL);
+    return kevent(g_kq, &ev, 1, NULL, 0, NULL);
+}
+
+// Has the document changed since the last call?
+static int st_changed(void) {
+    struct stat st;
+    if (stat("/tmp/wm/state.json", &st) != 0) return 0;
+    if (g_st_known == 1 && st.st_ino == g_st_ino && st.st_size == g_st_size
+        && st.st_mtimespec.tv_sec == g_st_time.tv_sec
+        && st.st_mtimespec.tv_nsec == g_st_time.tv_nsec)
+        return 0;
+    g_st_known = 1;
+    g_st_ino = st.st_ino;
+    g_st_size = st.st_size;
+    g_st_time = st.st_mtimespec;
+    return 1;
+}
+
+// obs.log is appended in place; if the observer restarts the inode changes and the watch is
+// re-armed here rather than left pointing at a dead vnode.
+static int obs_reopen(void) {
+    if (g_obsfd >= 0) close(g_obsfd);
+    g_obsfd = open("/tmp/wm/obs.log", O_EVTONLY);
+    if (g_obsfd < 0) return 0;
+    struct stat st;
+    if (fstat(g_obsfd, &st) == 0) g_obs_ino = (int)st.st_ino;
+    add_watch(g_obsfd, NOTE_WRITE | NOTE_EXTEND | NOTE_DELETE | NOTE_RENAME);
+    return 1;
+}
+
+static void watch_init(void) {
+    g_kq = kqueue();
+    if (g_kq < 0) return;
+    g_dirfd = open("/tmp/wm", O_EVTONLY);
+    add_watch(g_dirfd, NOTE_WRITE);
+    obs_reopen();
+}
+
+// Wait up to `ms` for a document/obs change.  Returns 1 when state.json moved, 2 when obs.log
+// moved, 0 on timeout, 3 when both did.  File events are delivered as wakeups, so this is not a
+// poll: the timeout only bounds how often the supervision branches below run.
+static int watch_wait(int ms, int *state_changed) {
+    *state_changed = 0;
+    if (g_kq < 0) { usleep((useconds_t)ms * 1000); return 0; }
+    struct timespec to = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    struct kevent ev[8];
+    int n = kevent(g_kq, NULL, 0, ev, 8, &to);
+    int r = 0;
+    for (int i = 0; i < n; i++) {
+        int fd = (int)ev[i].ident;
+        if (fd == g_dirfd && (ev[i].fflags & NOTE_WRITE)) {
+            if (st_changed()) { r |= 1; *state_changed = 1; }
+            // the observer may have replaced obs.log; re-arm if the inode moved
+            struct stat st;
+            if (g_obsfd >= 0 && stat("/tmp/wm/obs.log", &st) == 0 && (int)st.st_ino != g_obs_ino)
+                obs_reopen();
+        } else if (fd == g_obsfd) {
+            if (ev[i].fflags & (NOTE_DELETE | NOTE_RENAME)) obs_reopen();
+            else r |= 2;
+        }
+    }
+    return r;
+}
+
+// The keeper's per-call request (io_st_req).  The observer re-reads on a request file and acks it;
+// the ack does not depend on the document changing, because an unchanged document is still the
+// current truth and the keeper must be allowed to act on it.  Bounded: a dead observer costs at
+// most 20 ms, and the payload keeps its last good document meanwhile.
+static uint32_t g_st_acked;
+static double g_st_retry;                 // backoff after an unanswered request
+static double g_st_last;                  // coalesce: at most one refresh per 20 ms
+static void serve_st_req(void) {
+    uint32_t req = r32(g_io[IO_ST_REQ]);
+    if (req == g_st_acked) return;
+    if (tt() < g_st_retry) return;
+    // The keeper bumps the request on every call, which during a hover or a layout animation is
+    // tens of times a second.  A request is a *flag*, not a queue: one refresh covers every call
+    // that arrived since the last one, so serving faster than the document can meaningfully change
+    // only adds file round-trips.  20 ms is the document cadence the keeper was designed around.
+    if (tt() - g_st_last < 0.020) return;
+    FILE *f = fopen("/tmp/wm/state.req", "w");
+    if (f) { fprintf(f, "%u\n", req); fclose(f); }
+    double deadline = tt() + 0.020;
+    int acked = 0;
+    while (tt() < deadline) {
+        FILE *a = fopen("/tmp/wm/state.ack", "r");
+        if (a) {
+            unsigned v = 0;
+            if (fscanf(a, "%u", &v) == 1 && v == req) acked = 1;
+            fclose(a);
+        }
+        if (acked) break;
+        usleep(500);
+    }
+    publish_st();
+    g_st_last = tt();
+    if (acked) {
+        g_st_acked = req;
+        w32(g_io[IO_ST_ACK], req);
+        g_st_retry = 0;
+    } else {
+        // The observer is not answering.  Do not claim the request was served: the payload keeps
+        // deferring promotion (a stale document is worse than a late one) and this costs the
+        // helper one 20 ms wait per second, not per pass.
+        g_st_retry = tt() + 1.0;
+    }
+}
+
 // ---------------------------------------------------------------- map file
 static int load_map(void) {
     FILE *f = fopen(g_map, "r");
@@ -679,14 +809,21 @@ int main(int argc, char **argv) {
         return (ok && nobj && nmatch) ? 0 : 1;
     }
     if (!load_map()) { fprintf(stderr, "no map at %s — install first\n", g_map); return 1; }
+    watch_init();
+    st_changed();                    // prime: the first real change is what gets published
     uint32_t ack = 0;
-    double t_reg = 0, t_pd = 0, t_cen = 0;
+    double t_reg = 0, t_pd = 0, t_cen = 0, t_find = 0;
     int served = 0;
     fprintf(stderr, "hb: body=%#llx ids=%#llx rdv=%#llx\n",
             (unsigned long long)g_body, (unsigned long long)g_io[IO_IDS],
             (unsigned long long)g_io[IO_RDV]);
     for (;;) {
-        if (!g_task || g_pid != find_pid()) {
+        double t = tt();
+        // The pid census is supervision, not state: enumerating every process on the machine costs
+        // about a millisecond and the loop now wakes on file events (100/s), so checking it every
+        // pass would be the most expensive thing in this process.  A restart is still noticed
+        // within half a second, and every mach read fails immediately when the task is gone.
+        if (!g_task || (t - t_find > 0.5 && (t_find = t, find_pid() != g_pid))) {
             detach();
             if (!attach()) { if (once) return 1; usleep(500000); continue; }
             census(tt() - 100.0);        // baseline: everything now is old, so nothing is offered
@@ -694,7 +831,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "hb: attached pid=%d slide=%#llx baseline=%d\n", g_pid,
                     (unsigned long long)g_slide, nW);
         }
-        double t = tt();
         uint32_t rdv = r32(g_io[IO_RDV]);
         int did = 0;
         if (rdv != ack) {
@@ -702,10 +838,9 @@ int main(int argc, char **argv) {
             int n = census(t);
             publish_ids(t);
             publish_pd_cut(t0 - 0.10);
-            // A birth creates a new WindowID *and* a new CGWindowID, but the user-side observer
-            // sees the CGWindowID on its own 20 ms poll. When the census has just found a new
-            // WindowID, give the observer that one poll before answering: that is what makes
-            // "the window that just appeared" a tight set instead of "everything on screen".
+            // A birth creates a new WindowID *and* a new CGWindowID.  The observer now publishes
+            // the CGWindowID on the creation notification rather than on its next 20 ms poll, so
+            // the probe below is a short grace period for the file write, not a poll interval.
             if (n > 0) {
                 double deadline = tt() + 0.20;
                 while (tt() < deadline) {
@@ -733,11 +868,21 @@ int main(int argc, char **argv) {
             printf("rdv %u: census +%d (total %d) %.1f ms\n", rdv, n, nW, el);
             did = 1;
         }
+        // The keeper's own call is an event: refresh the document it is about to be judged on.
+        // This is the lost-notification defence - the observer re-reads and acks, and only then do
+        // we publish and mark the request served.
+        serve_st_req();
         if (!did && t - t_pd > 0.02) { t_pd = t; publish_pd(); publish_st(); }
         if (!did && t - t_reg > 0.25) { t_reg = t; publish_rg(); }
         if (!did && t - t_cen > 2.0) { t_cen = t; census(t); publish_wids(t); publish_widcg(); }
         if (once) { printf("once: served=%d W=%d\n", served, nW); break; }
-        usleep((useconds_t)(interval * 1e6));
+        // Wait on the two files that carry the observer's output.  A change is published now; the
+        // timeout keeps the supervision branches (registry, census, the request above) alive.
+        int st_moved = 0;
+        int how = watch_wait((int)(interval * 1000.0), &st_moved);
+        if (how & 2) publish_pd();
+        if (how & 1) publish_st();
+        (void)st_moved;
     }
     detach();
     return 0;

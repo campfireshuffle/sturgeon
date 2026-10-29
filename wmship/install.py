@@ -1430,7 +1430,8 @@ def install():
            "rdv", "rdv_ack", "hb", "hb_len", "poses", "poses_len", "log", "log_w",
            "res", "res_len", "ss", "ss_len",
            "self", "self_len", "inj_n", "inj_wid", "inj_cg", "mw_n", "mw", "magic",
-           "widcg", "widcg_len", "widcg_gen", "wids", "wids_len", "wids_gen")}
+           "widcg", "widcg_len", "widcg_gen", "wids", "wids_len", "wids_gen",
+           "st_req", "st_ack")}
     cfg = build_config_text().encode()
     wrmem(body + io["cfg"], cfg)
     wrmem(body + io["cfg_len"], struct.pack("<I", len(cfg)))
