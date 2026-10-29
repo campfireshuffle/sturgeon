@@ -209,6 +209,20 @@ else
   fail "wmship.sh calls a verb the helper does not implement"
 fi
 
+# The Swift app is not a shell script, so the extraction above cannot see its calls.  These are
+# the verbs the app's diagnostics path invokes directly (Sources/SturgeonKit); keep the list in
+# step with it.  `counters` is the panel's keep/learn/replay/dil source when the daemon is up.
+APP_VERBS="counters"
+MISSING_APP=""
+for v in $APP_VERBS; do
+  printf '%s\n' "$VERB_LINE" | tr ' ' '\n' | grep -qx "$v" || MISSING_APP="$MISSING_APP $v"
+done
+if [ -z "$MISSING_APP" ]; then
+  pass "every verb the Swift app calls directly is in asroot --verbs ($APP_VERBS)"
+else
+  fail "app-facing verbs missing from asroot --verbs:$MISSING_APP"
+fi
+
 # A `-c` passthrough (or a direct install.py/ctl.py call) in the shipped scripts is a failure,
 # not just an unmatched verb: the helper is the only privileged path, and it takes verbs only.
 if /usr/bin/python3 - "$T/wmship.sh" "$T/setup.sh" "$T/teardown.sh" <<'PY'

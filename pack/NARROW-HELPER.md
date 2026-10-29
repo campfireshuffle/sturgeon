@@ -32,6 +32,7 @@ argv itself and exposes only fixed verbs:
 | `pristine` | `install.py pristine` (byte-exact site check) |
 | `install` / `uninstall` | write / restore the six sites |
 | `log` | `install.py log` |
+| `counters` | `install.py counters` — the daemon's keep/learn/replay/dil counters, read by the app's diagnostics panel (the app is not a shell script, so selftest checks this verb against an explicit list) |
 | `probe` | the NOPASSWD root probe: exits 0 as root, 1 otherwise; this replaced `-c true` so the shipped shell scripts no longer use the passthrough shape at all |
 | `selfcheck` | `ctl.py selfcheck` — the app's slider preflight: proves the strip can be measured and restored at 1.0 before it is offered |
 | `teach` | `ctl.py teach` — record the strip's natural widths once |
