@@ -123,20 +123,26 @@ whenever strip-on-top had run first (measured: `learn 0` across a whole teach sw
 
 **Two poses, not one.** A tile carries a *resting base* and a *replay transform*, because the two
 capabilities want opposite things from a pose and coupling them made one regress whenever the other
-was fixed. The base is strict — it is the pose the WindowManager wrote and then stopped writing,
-which is the only thing that may be scaled. The replay transform only has to keep the tile drawn,
-so it is taught from looser candidates (any settled write while the strip is on screen, at any
-scale) and it is what strip-on-top puts back. On-top therefore works for a tile that has never been
-taught a resting base, which is what a tightened teach gate used to break: measured 6/6 tiles at
-layer 3 above a flush window in three trials with `bases 0`, and again 6/6 in three trials with
-thirteen bases. Both are *promoted* after 0.22 s of silence rather than captured per write — a
-retract is a run of animation frames that would otherwise be followed into the hidden pose.
+was fixed.
 
-Two invariants matter when touching this code. Poses are stored as raw bytes, so comparisons must
-cast to `double` before reading the scale entry; comparing the byte array directly compares one
-mantissa byte and silently produces plausible-looking decisions. And a pose's translation and its
-scale change independently: a hide moves the tile without changing its scale, so "the pose moved" is
-not evidence of a relayout.
+- The **base** is the only thing that may be scaled, and it is strict: the pose the WindowManager
+  wrote, then stopped writing, *and* the largest first scale entry (`m0`) the tile shows.
+- The **replay transform** only has to keep the tile drawn, so it is taught from looser candidates —
+  any settled write while the strip is on screen, at any scale — and it is what strip-on-top puts
+  back. On-top therefore works for a tile that has never been taught a resting base, which is what a
+  tightened teach gate used to break: measured 6 of 6 tiles at layer 3 above a flush window in three
+  trials with no base at all, and again in three trials with bases present.
+
+"Stopped writing" alone is not enough for a base. A pointer that comes to rest on a tile lifts it,
+and then the WindowManager is silent — which is exactly the shape of a settle. `m0` is
+`natural / drawn`, so a lift is the *smaller* value and the resting pose is the largest; without that
+test `resize 1.5` renders `1.5 × lift`. Measured with a pointer parked on one tile: 1.607 for that
+tile against 1.490–1.500 for the rest before the test, 1.493 after it. A base also describes the
+drawing that is on screen *now*, so it is dropped when the strip leaves: a layout change arrives
+through a hide, and the next teach pass starts from an empty base instead of being pinned to a pose
+from a drawing that no longer exists. Both poses are *promoted* after 0.22 s of silence rather than
+captured per write — a retract is a run of animation frames that a per-write rule would follow into
+the hidden pose (measured: six tiles replayed at the retracted pose and never came back).
 
 ## State channel
 

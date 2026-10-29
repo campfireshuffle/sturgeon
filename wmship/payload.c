@@ -1508,6 +1508,14 @@ static void promote_one(struct pose *p, double t, int out) {
     p->cand_ok = 0;
     if (!out) return;                       // candidates are recorded only at scale 1.0, strip out
     if (p->hasbase && memcmp(p->base, p->cand, 128) == 0) return;
+    // A base is the LARGEST m0 a tile shows.  m0 is natural divided by drawn, so a hover lift --
+    // the tile drawn ~6% larger -- is the *smaller* value, and the resting pose is the largest.
+    // Quiet promotion alone cannot tell them apart: a pointer that comes to rest on a tile lifts
+    // it and the WM then stops writing, which is exactly the shape of a settle (measured: 1.883 at
+    // rest, 1.775 lifted).  Without this test that lift becomes the base and `resize 1.5` renders
+    // `1.5 x 1.06` -- round 34 by another route.  Cast to double: `p->base` is a u8[128], and
+    // `p->base[0]` is one byte of the double, which is how round 34 shipped a 5% error.
+    if (p->hasbase && ((const double *)p->cand)[0] < ((const double *)p->base)[0] - 1e-9) return;
     memcpy(p->base, p->cand, 128);
     p->hasbase = 1;
     p->t_base = t;
@@ -1601,19 +1609,18 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     G.was_out = out;
     int retract = (p->hasbase && is_retract(m, p->base)) || (p->hasrp && is_retract(m, p->rp));
     if (retract && !force) G.hold_until = now() + 0.50;
-    // A base is only ever taught while the strip is genuinely out, so it cannot be the hidden
-    // pose, and it is kept across the hide: it is exactly what the replay needs when a flush
-    // arrives.  What is discarded on a hide is the state of windows that are no longer part of
-    // the strip at all -- a window that comes back into the strip re-teaches its current layout
-    // instead of replaying an old one.  (Round 32's complaint was bases taught *during* the
-    // retract; the gate above is what prevents those, and clearing every base on every hide cost
-    // the next trial its coverage: 5 of 6 tiles replayed, measured.)
+    // A base describes the drawing that is on screen right now, so it is dropped when that
+    // drawing goes away -- for strip members too.  That is what makes "keep the largest m0" safe:
+    // a layout change (fewer tiles, a different stage, a different strip scale) arrives through a
+    // hide, so the next teach pass starts from an empty base instead of being pinned to a pose
+    // from a drawing that no longer exists.  The replay transform is what has to survive the
+    // hide, and `rp` is a separate field precisely so this one does not have to.
     if (prev && !out && !force)
         for (int i = 0; i < MAXP; i++) {
             struct pose *q = &G.pose[i];
             if (!q->used) continue;
-            if (in_ids(q->wid, G.strip_ids, G.n_strip)) continue;
             q->hasbase = 0;
+            if (in_ids(q->wid, G.strip_ids, G.n_strip)) continue;
             q->hasrp = 0;
             q->hasmine = 0;
             q->haslvl = 0;
@@ -1621,19 +1628,31 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
 
     // ---- the replay transform (issue #20) ------------------------------------------------------
     // Strip-on-top needs a pose that keeps the tile drawn, for every tile, immediately.  The
-    // resting base cannot do that job: it is deliberately hard to earn and a tile that has not
-    // been taught yet has none, which is exactly why tightening the teach gate took on-top from
-    // 7/7 to 3/7.  So the two uses have two fields.  `rp` is refreshed from every write that draws
-    // the tile in the gutter and from no write that walks it out: `out` is false during a hide,
-    // and the retract arrives as a run of leftward steps before the document has caught up, so a
-    // leftward step from the current `rp` never becomes one.
+    // resting base cannot do that job: it is deliberately strict and a tile that has not been
+    // taught yet has none, which is exactly why tightening the teach gate took on-top from 7/7 to
+    // 3/7.  So the two uses have two fields.
     //
-    // It is *promoted*, not captured, and that is the whole trick: a retract is a run of leftward
-    // animation frames that all arrive while the document still says the strip is out, so a rule
-    // that refreshed on every write would follow the strip into its hidden pose (measured: six
-    // tiles replayed at the retracted pose and never came back).  QUIET is what makes an animation
-    // frame ineligible, and the promotion-time `out` re-read is what makes the *last* frame of a
-    // retract ineligible even when it happens to be followed by silence.
+    // The rule, stated exactly as the code implements it -- there is no geometric test on the
+    // write, and an earlier version of this comment claimed one that did not exist:
+    //
+    //   1. every write that arrives while the document says the strip is drawn and that is not our
+    //      own becomes the *candidate* (`rpcand`);
+    //   2. a candidate is promoted only after QUIET (0.22 s) with no newer write for that window,
+    //      and only if the document still says the strip is drawn at promotion time;
+    //   3. a candidate written before the strip last came out (`t_out_since`) is never promoted.
+    //
+    // The margins that make that safe against a retract, which is what it has to survive:
+    //   * the longest gap *inside* one animation is 0.13 s (measured on this build), so a frame of
+    //     an animation is always superseded before QUIET elapses;
+    //   * the document is republished every ~25 ms (`r21obs`), and a retract is ~0.3 s of writes,
+    //     so `out` goes false within a tick or two of the retract starting: the last retract frame
+    //     would have to be followed by 0.22 s of silence *and* the document would have to still
+    //     say "drawn", which is 25 ms of lag against 220 ms of quiet -- it cannot be both;
+    //   * and if it somehow were, rule 3 rejects it: after the next reveal `t_out_since` is newer
+    //     than that candidate.
+    // This replaced a per-write refresh, which does follow the strip out: measured, six tiles
+    // replayed at the retracted pose and never came back.
+    //
     // `ours` stays part of THIS one: a replay transform only has to keep the tile drawn, so a
     // lift pose is acceptable, while our own scaled matrix (written during a resize) is not.
     if (!ours && !is_identity(m) && out) {
