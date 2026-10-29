@@ -183,9 +183,22 @@ pointer sweep across every tile with scaling disabled, which makes the WindowMan
 tile's animation in and back out again. The value the return animation settles on is that tile's
 resting pose, and it is stored as the base for all later scaling. A single tile costs about a
 second: roughly 250 ms of animation in, a dwell, about 300 ms back out, and a settle. That
-animation time, not computation, is why a teach pass over a full strip takes a minute or two and
-why the pointer moves while it runs. Once the bases are known, `resize` reuses them and does only
-a measurement sweep (`resize --teach` or `wmship.sh teach` forces a fresh pass).
+animation time, not computation, is why the pointer moves while it runs.
+
+A full teach pass is one sweep over the tiles. If a tile has not settled when the sweep ends,
+`wait_bases` supplies a short **wake**: it hovers a tile that already has a base, returns to the
+gutter, and waits for the payload's settled flags, with a 2.5 s ceiling. The sweep starts and ends
+in the gutter at `x=3`, never inside a tile. A park inside a tile re-hovers it after the last real
+visit and leaves its candidate as the sweep's final write; a candidate needs a later keeper call to
+be promoted, so that tile would end the pass unsettled. Once the bases are known, `resize` reuses
+them and does only a measurement sweep (`resize --teach` or `wmship.sh teach` forces a fresh pass).
+A `resize` completes in tens of seconds, not minutes.
+
+A tile that is still unsettled at the end of the pass is reported in `no_base` and left at 1.0; it
+does not block the others. `resize` scales the tiles that have a base and reports `no_base`,
+`scaled`, `not_scaled` and `partial`, and a non-1.0 scale is never `ok` when a tile was skipped. A
+1.0 restore can still be `ok` for a tile that was never moved, but the list is reported in every
+case. Only a pass that finds no strip tiles at all refuses the command.
 
 The teach pass also records each tile's resting frame (`x`, `y`, `w`, `h`) at scale 1.0. `resize
 1.0` compares the frame it measures against that record and fails a tile that comes back more than
@@ -314,14 +327,17 @@ are monotonic, so a wrap is distinguishable from a gap.
 
 It is **write-only by construction**: no branch in `payload.c` reads `io_tr`, and `wmship/selftest.py`
 asserts that. Turning it on cannot change a keeper decision. Use it when a width ratio is wrong,
-when a teach pass reports a tile with no base, or when the strip retracts during a sweep: the record
+when `resize` reports a tile in `no_base`, or when the strip retracts during a sweep: the record
 shows which gate refused the write (`T`, `r`, `o`, `a`, `h`) and how far a candidate got (`c`, `q`).
 Measured: one hover sweep produced 143 records, the largest 113 bytes; with the key back off, the
 same sweep produced no new records and the next teach's decisions were unchanged (`bases 14 → 14`).
 
-The menu-bar app's pose-trace toggle is being connected to this key separately. Until that ships the
-app's control writes nothing, and the supported way to turn the trace on is
-`wmship.sh cfg '{"trace":true}'`.
+The menu-bar app's **Pose trace** toggle writes the `trace` key. **Show trace** runs `wmship.sh
+trace` and shows the last 40 records with this legend. The read has three states: records,
+`unavailable` (the command succeeded but the ring returned nothing — an older payload without the
+trace ring, or no keeper decision yet), and `failed` (the refusal line). An older payload therefore
+shows `unavailable`, not an empty table. The toggle is disabled while disarmed, and turning the
+trace off drops the last read.
 
 ## The app
 
@@ -397,7 +413,7 @@ future macOS can invalidate. What matters is whether a break is loud or quiet.
 | Tiles emit transforms on pointer movement | emission changes | **quiet**: sweeps produce nothing, resize does nothing |
 | Hover animation shape (burst length, settle value) | timing or easing changes | **quiet**: bases are wrong by a few percent |
 | Pivot derivation from the rail's drawn app-tile frames | a document with no drawn app tile | **loud**: the scale is refused and counted (`pivmiss`); `resize` to a non-1.0 scale fails its ratio check instead of scaling about a guessed point |
-| Transition holds (0.30–0.50 s) around a reveal, retract or departure | slower or faster animations | **loud**: a teach pass can report `no_base` and be retried; promotion is document-ticked, so a mid-animation frame is not promoted |
+| Transition holds (0.30–0.50 s) around a reveal, retract or departure | slower or faster animations | **loud**: a tile can be named in `no_base` and left at 1.0 while the others scale; a non-1.0 `resize` reports `partial` and never `ok`. Promotion is document-ticked, so a mid-animation frame is not promoted |
 
 The quiet ones are the reason the resize path verifies every tile against a freshly measured natural
 size, reports per-tile ratios, and checks x/y restoration at 1.0. They are also why the keeper
@@ -429,8 +445,9 @@ Known weak points, in the order they are worth hardening:
   end-to-end birth capability did not reproduce on the last attempt (see Verification).
 - Per-tile transform replay: the WindowManager's own transaction API, no polling loop in the target.
 - The payload contains no timers; it acts only when the patched code runs.
-- A resize teach-and-measure pass is dominated by animation time, not work: roughly one second per
-  tile, so a full `resize` is a minute or two.
+- A `resize` that has to teach pays one pointer sweep over the tiles, plus a short wake (2.5 s
+  ceiling) only when a tile has not settled; later calls reuse the bases and pay only the
+  measurement sweeps. A complete `resize` finishes in tens of seconds, not minutes.
 - `selfcheck` costs two short sweeps (probe and restore); the strip is visibly at 1.2 for a few
   seconds.
 
@@ -483,4 +500,4 @@ What has actually been exercised, and what has not, on the current tree:
 | Births | implemented, **unverified end-to-end**: the last two attempts injected nothing (`inject=0`) and the window became a strip tile |
 | `selfcheck` | logic and app gate unit-tested (#35); the pass path on a live armed install has not been observed — owner check |
 | App diagnostics, gesture resize, drop-to-tile | decision code unit-tested; live paths **not exercised** against an armed WindowManager |
-| Pose trace | **present**; owner-verified: one hover sweep wrote 143 records, largest 113 bytes; with `trace=false` no new records appeared and the next teach's decisions were unchanged (`bases 14 → 14`). Write-only, asserted by `wmship/selftest.py`; the app's toggle is being wired separately |
+| Pose trace | **present**; owner-verified: one hover sweep wrote 143 records, largest 113 bytes; with `trace=false` no new records appeared and the next teach's decisions were unchanged (`bases 14 → 14`). Write-only, asserted by `wmship/selftest.py`. The app's **Pose trace** toggle writes `trace`; **Show trace** reads the ring and shows the last 40 records, or `unavailable` on an older payload |

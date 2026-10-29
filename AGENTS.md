@@ -146,13 +146,18 @@ concurrent installs invalidate each other.
   teaching off, requires every tile within 2%, then restores the caller's scale; the strip visibly
   scales for a few seconds. The app runs it when the popover opens and withholds the size slider
   until it passes; the pass path on a live armed install is still an owner check.
+- A tile with no resting base is **skipped, not a command-wide refusal**. `resize` scales the tiles
+  that have one and reports `no_base`, `scaled`, `not_scaled` and `partial`; a non-1.0 scale is
+  never `ok` when a tile was skipped. Only a pass with no strip tiles at all refuses.
 - The app's diagnostics panel, gesture resize and drop-to-tile paths are unit-tested at their pure
   seams only; none has been exercised against an armed WindowManager. Label them implemented but
   unverified.
 - `cfg trace=true` is diagnostic and **write-only**: the keeper writes one record per decision to a
   16 KB ring, no branch reads `io_tr`, and `wmship/selftest.py` asserts that. Read it with
   `wmship.sh trace [--reset]`; the field legend is in `docs/TECHNICAL.md`. It cannot change a
-  decision, but turn it off when the diagnosis is done. The app's toggle is being wired separately.
+  decision, but turn it off when the diagnosis is done. The app's **Pose trace** toggle writes
+  `trace`, and **Show trace** reads the ring; an older payload shows `unavailable`, not an empty
+  table.
 - Verify with numbers (window layers, per-tile geometry), not with screenshots of intent.
 
 ## Keeping up with macOS
