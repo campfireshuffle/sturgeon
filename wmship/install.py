@@ -25,6 +25,7 @@ the payload needs (the WindowID / WindowIDTable class metadata) come from the bu
 is written: the profile's isa must agree with the WM's own table serials, and its ivar-offset
 globals must read as small aligned offsets.  A profile that does not verify is a refusal.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -63,6 +64,9 @@ STATE = D + "/state.json"
 BAK = D + "/backup.json"
 MAP = D + "/map.txt"
 LOG = D + "/install.log"
+LASTOP = D + "/last_op.json"       # the last mutating wmx operation, for the daemon's crash record
+CRASH = D + "/crash.json"          # written by the daemon, cleared by a human `doctor`
+LOCK = D + "/install.lock"         # one armer at a time (see lock_install)
 
 # Scratch files clang needs (the symbol resolver).  D is the daemon's directory and is owned by
 # root once the daemon has run; `doctor` and `resolve` are also invoked as the console user, so
@@ -124,7 +128,30 @@ def log(m):
             continue
 
 
+MUTATING = ("alloc", "allocat", "allocmap", "allocnear", "remap", "prot", "wr", "wf", "dealloc")
+
+
+def note_op(op):
+    """Record the operation about to run, for the daemon's crash record.
+
+    Written *before* the operation, deliberately: an operation that kills WindowManager is exactly
+    the one that never gets to report afterwards.  The daemon reads this when it finds the pid has
+    changed without a clean stop, so "the last operation" is evidence rather than a guess."""
+    if not os.path.isdir(D):
+        return                                  # a read-only run must not create the runtime dir
+    try:
+        with open(LASTOP + ".tmp", "w") as f:
+            json.dump({"op": op, "t": time.time(), "pid": os.getpid()}, f)
+        os.replace(LASTOP + ".tmp", LASTOP)
+    except Exception:
+        pass
+
+
 def wmx(*a):
+    # every write to the target goes through here, and every one of them is logged: the first
+    # element is the verb, the next two are enough to identify the page (the blob is dropped)
+    if a and str(a[0]) in MUTATING:
+        note_op("%s %s" % (a[0], " ".join(str(x) for x in a[1:3])))
     return root("%s %s" % (shlex.quote(WMX), " ".join(str(x) for x in a)))
 
 
@@ -213,7 +240,58 @@ def words(at, n):
     return [struct.unpack_from("<I", d, 4 * i)[0] for i in range(len(d) // 4)]
 
 
+# ---------------------------------------------------------------- protection, before writing
+# A wrong write is not a tool error here: it is a bus error inside WindowManager, which takes the
+# window server session with it.  The crash reports for issue #19 are that failure -- an instruction
+# fetch at a page whose protection was rw- (writable, not executable) inside a process that had
+# been armed and disarmed several times.  So nothing this file writes may rely on the helper's own
+# fallback: `wmx wr` makes a page writable to push a write through and does not put the protection
+# back, so a write to a page we did not mean to own can leave it non-executable for the next branch
+# into it.  Instead, ask first, write only if the page is already writable, and verify the
+# protection we depend on afterwards.  A page that is not what we expect is a named refusal.
+def region_at(addr):
+    """The live protection of the region containing `addr`, read from the target itself.
+
+    `wmx regions <a> <b>` prints one line per region:
+        <lo>-<hi> <size> prot=r-x max=rwx shared=1 res=0
+    """
+    out, err, rc = wmx("regions", hex(addr), hex(addr + 1))
+    for line in (out or "").split("\n"):
+        f = line.split()
+        if len(f) < 4 or "-" not in f[0]:
+            continue
+        try:
+            lo, hi = [int(x, 16) for x in f[0].split("-")]
+        except ValueError:
+            continue
+        if not (lo <= addr < hi):
+            continue
+        prot = f[2].split("=", 1)[1] if "=" in f[2] else "???"
+        maxp = f[3].split("=", 1)[1] if "=" in f[3] else "???"
+        return {"lo": lo, "hi": hi, "size": hi - lo, "prot": prot, "maxprot": maxp}
+    return None
+
+
+def require_prot(addr, want, why):
+    """Refuse unless the region holding `addr` currently has every permission in `want`."""
+    r = region_at(addr)
+    if not r:
+        raise Refuse("%s: cannot read the protection of %#x (is WindowManager still running?)"
+                     % (why, addr))
+    for c in want:
+        if c not in r["prot"]:
+            raise Refuse("%s: page %#x is %s (need %s) -- refusing instead of touching it"
+                         % (why, r["lo"], r["prot"], want))
+    return r
+
+
 def wrmem(at, blob):
+    """Write through the helper, but only to a page that is already writable.
+
+    `wmx wr` falls back to making the page writable (and leaves it that way) when the bare write is
+    refused; that is how a page can end up rw- under a live branch.  Checking first means the
+    fallback is never reached: an unwritable target is a refusal with a name, not a fault."""
+    require_prot(at, "w", "write %d bytes" % len(blob))
     out, err, rc = wmx("wr", hex(at), blob.hex())
     return rc == 0
 
@@ -362,6 +440,17 @@ def bl_target(word, pc):
 
 def is_bl(word):
     return (word & 0xFC000000) == 0x94000000
+
+
+def b_target(word, pc):
+    """Target of an unconditional `b`, or 0.  `bl` and `b` share the encoding; only the opcode
+    differs, and the difference is what decides whether a branch *returns*."""
+    if (word & 0xFC000000) != 0x14000000:
+        return 0
+    imm = word & 0x3FFFFFF
+    if imm & 0x2000000:
+        imm -= 0x4000000
+    return pc + imm * 4
 
 
 def le32(*w):
@@ -767,6 +856,17 @@ def _doctor_armed(rep, inst, f, chk, do_live, as_json):
 
 
 def _doctor_out(rep, as_json, inst=None):
+    # A human `doctor` (or `start`, which runs it) is what clears the daemon's crash block.  The
+    # daemon's own call passes --json and must never clear it: the whole point of the block is
+    # that a machine cannot decide on its own to re-arm after WindowManager died under the patch.
+    if rep["ok"] and not as_json:
+        try:
+            os.unlink(CRASH)
+            print("cleared the daemon's crash block (%s)" % CRASH)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
     if as_json:
         print(json.dumps(rep, indent=1, sort_keys=True))
         return 0 if rep["ok"] else 1
@@ -944,10 +1044,31 @@ def guard_candidates():
     return rows
 
 
+def live_branches_into(lo, hi, site_addrs):
+    """Does any *currently installed* site branch into [lo, hi)?
+
+    The island is taken from a page that is already dead (`---`), but "dead" is a claim about the
+    present: a previous install whose sites were never restored can still hold a `b` into this
+    page, and re-allocating it writable-and-not-executable under that branch is a bus error inside
+    WindowManager the moment the patched code runs.  So look, instead of assuming."""
+    for at, s in site_addrs or []:
+        w = words(at, 3)
+        if not w:
+            continue
+        for i, word in enumerate(w):
+            t = b_target(word, at + 4 * i) or bl_target(word, at + 4 * i)
+            if t and lo <= t < hi:
+                return (hex(at), s.get("name") if isinstance(s, dict) else "?")
+    return None
+
+
 def allocate_island(site_addrs):
+    # accept [(addr, site)] as well as [addr]: the branch check needs the site, not just its address
+    sites = [(s, {"name": "?"}) if isinstance(s, int) else (s[0], s[1]) for s in site_addrs]
+    adds = [a for a, _ in sites]
     cands = []
     for kind, a, line in guard_candidates():
-        worst = max(abs(a - s) for s in site_addrs)
+        worst = max(abs(a - x) for x in adds)
         if worst <= DIRECT_REACH:
             cands.append((kind, worst, a, line))
     if not cands:
@@ -955,6 +1076,10 @@ def allocate_island(site_addrs):
                      % (DIRECT_REACH // 0x100000))
     cands.sort()
     for kind, worst, a, line in cands[:6]:
+        into = live_branches_into(a, a + 0x4000, sites)
+        if into:
+            log("island: skip %#x — %s at %s still branches into it" % ((a,) + into))
+            continue
         out, err, rc = wmx("dealloc", hex(a), hex(0x4000))
         if rc != 0:
             log("island: dealloc %#x failed: %s" % (a, out))
@@ -963,6 +1088,10 @@ def allocate_island(site_addrs):
         if rc != 0:
             log("island: allocat %#x failed: %s" % (a, out))
             continue
+        r = region_at(a)
+        if not r or "w" not in r["prot"] or r["lo"] != a:
+            raise Refuse("island: %#x came back as %s, not a writable 16K page at that address"
+                         % (a, (r or {}).get("prot", "unmapped")))
         log("island %#x (worst %d MB from a site; %s)" % (a, worst // 0x100000, line))
         return a, kind, line
     raise Refuse("could not take a near page")
@@ -1019,9 +1148,21 @@ def cleanup_orphans():
             return                                   # a live install owns them
     except Exception:
         pass
+    sites = []
+    try:
+        b = json.load(open(BAK))
+        if b.get("pid") == p.get("pid"):
+            sites = [(v["addr"], {"name": k}) for k, v in (b.get("sites") or {}).items()]
+    except Exception:
+        pass
     if p.get("body"):
         wmx("dealloc", hex(p["body"]), hex(p.get("size", 0)))
     if p.get("island"):
+        into = live_branches_into(p["island"], p["island"] + 0x4000, sites)
+        if into:
+            raise Refuse("orphan island %#x is still the target of the %s branch at %s; "
+                         "run `stop` before installing again"
+                         % ((p["island"], into[1], into[0])))
         wmx("dealloc", hex(p["island"]), hex(0x4000))
         if wmx("allocat", hex(p["island"]), hex(0x4000))[2] == 0:
             wmx("prot", hex(p["island"]), hex(0x4000), "none")
@@ -1042,8 +1183,63 @@ def img_sha256():
         return None
 
 
+def island_selftest(island, want, stubs, body, spl):
+    """The pre-arm self-test (issue #19): the exact write / protect / read-back path, on the
+    island, *before* a single live site is patched.
+
+    Every site we install is one branch away from the island.  If the island is not executable the
+    first time the patched code runs, WindowManager dies with KERN_PROTECTION_FAILURE and the crash
+    report does not say which tool did it; the same is true one level deeper for the body the
+    island branches into.  Two reads and one comparison turn that into a refusal."""
+    r = require_prot(island, "rx", "self-test: island %#x" % island)
+    got = rb(island, 0x4000)
+    if len(got) != 0x4000:
+        raise Refuse("self-test: cannot read the island back (%d of 16384 bytes)" % len(got))
+    if got[:len(want)] != want:
+        at = next(i for i in range(len(want)) if got[i] != want[i])
+        raise Refuse("self-test: island %#x read back differs at +%#x: wrote %s, read %s"
+                     % (island, at, want[at:at + 8].hex(), got[at:at + 8].hex()))
+    rb_body = require_prot(body, "rx", "self-test: body code %#x" % body)
+    if rb_body["size"] < spl:
+        raise Refuse("self-test: the body's code region is %#x bytes, expected at least %#x"
+                     % (rb_body["size"], spl))
+    require_prot(body + spl, "w", "self-test: body data %#x" % (body + spl))
+    log("SELFTEST island %#x r-x %d stubs verified; body %#x r-x, data rw; no site patched yet"
+        % (island, len(stubs), body))
+
+
+_LOCK_FH = None
+
+
+def lock_install():
+    """One armer at a time, enforced rather than documented.
+
+    Two concurrent installs invalidate each other, and the way they do it is the worst failure this
+    tool has: one of them deallocates and re-allocates the island -- as a writable, non-executable
+    page -- while the other's patched sites already branch into it.  That is an instruction abort
+    inside WindowManager, not a tool error.  The lock is per runtime directory and released by the
+    kernel when the process exits, so a killed install cannot wedge it."""
+    global _LOCK_FH
+    if _LOCK_FH is not None:
+        return
+    os.makedirs(D, exist_ok=True)
+    fh = open(LOCK, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise Refuse("another install/uninstall is running (%s is held); refusing to touch "
+                     "WindowManager concurrently" % LOCK)
+    fh.seek(0)
+    fh.truncate()
+    fh.write("%d %.3f\n" % (os.getpid(), time.time()))
+    fh.flush()
+    _LOCK_FH = fh
+
+
 def install():
     global SY, PID
+    lock_install()
     os.makedirs(D, exist_ok=True)
     cleanup_orphans()
     f = find()
@@ -1063,6 +1259,17 @@ def install():
                 return 0
             print("payload image changed since the install — reinstalling (was %s)"
                   % (st.get("img_sha256") or "unrecorded")[:12])
+            uninstall()
+            PID = find()["pid"]
+    except Exception:
+        pass
+    # A backup for this pid means a previous install may still be in place.  Restore it before we
+    # allocate anything: the new island must never be taken from a page a live branch still points
+    # into, and the only way to be sure is to have no live branches at all.
+    try:
+        bak = json.load(open(BAK))
+        if bak.get("pid") == PID and bak.get("sites") and os.path.exists(STATE):
+            print("restoring the previous install first (pid %d)" % PID)
             uninstall()
             PID = find()["pid"]
     except Exception:
@@ -1098,7 +1305,7 @@ def install():
     for i, (k, v) in enumerate(order):
         struct.pack_into("<Q", img, syms["_SL"] + 8 * i, v)
 
-    island, ikind, iline = allocate_island([a for a, s in site_addrs if s["near"]])
+    island, ikind, iline = allocate_island([(a, s) for a, s in site_addrs if s["near"]])
     out, err, rc = wmx("alloc", hex(size))
     if rc != 0:
         raise Refuse("body allocation failed: " + err)
@@ -1112,8 +1319,12 @@ def install():
         raise Refuse("body write failed")
     spl = min([sec["off"] for name, sec in secs.items() if name.startswith("__DATA")] or [0x8000])
     spl &= ~0x3FFF
-    wmx("prot", hex(body), hex(spl), "rx")
-    wmx("prot", hex(body + spl), hex(size - spl), "rw")
+    for what, page, n, want in (("code", body, spl, "rx"), ("data", body + spl, size - spl, "rw")):
+        out, err, rc = wmx("prot", hex(page), hex(n), want)
+        if rc != 0:
+            raise Refuse("body %s page %#x: prot %s failed: %s" % (what, page, want,
+                                                                   (out or err).strip()))
+        require_prot(page, want, "body %s page" % what)
 
     isl = bytearray(img[island_sec["off"]:island_sec["off"] + island_sec["size"]])
     a = lambda sym: island + (syms[sym] - island_sec["off"])
@@ -1150,7 +1361,10 @@ def install():
         stubs[s["name"]] = a(stub)
     if not wrmem(island, bytes(isl)):
         raise Refuse("island write failed")
-    wmx("prot", hex(island), hex(0x4000), "rx")
+    out, err, rc = wmx("prot", hex(island), hex(0x4000), "rx")
+    if rc != 0:
+        raise Refuse("island %#x: prot rx failed: %s" % (island, (out or err).strip()))
+    island_selftest(island, bytes(isl), stubs, body, spl)
 
     io = {k: syms["_io_" + k] for k in
           ("cfg", "cfg_len", "cfg_gen", "st", "st_len", "st_gen", "rq", "rq_len", "rq_gen",
@@ -1180,9 +1394,15 @@ def install():
         out, err, rc = wmx("remap", hex(at & ~0x3FFF), str(at & 0x3FFF), blob.hex())
         if rc != 0:
             raise Refuse("remap %s failed: %s" % (s["name"], out))
-        wmx("prot", hex(at & ~0x3FFF), hex(0x4000), "rx")
+        out, err, rc = wmx("prot", hex(at & ~0x3FFF), hex(0x4000), "rx")
+        if rc != 0:
+            raise Refuse("%s: prot rx on the patched page %#x failed: %s"
+                         % (s["name"], at & ~0x3FFF, (out or err).strip()))
         if rb(at, len(blob)) != blob:
             raise Refuse("verify %s failed" % s["name"])
+        # the page we just made into a fork in the road must be executable: a `b` in a rw- page is
+        # an instruction abort, which is exactly the KERN_PROTECTION_FAILURE of issue #19
+        require_prot(at, "rx", "%s site page" % s["name"])
         bak["sites"][s["name"]] = {"addr": at, "orig": cur.hex(), "len": len(blob),
                                    "new": blob.hex(), "stub": stubs[s["name"]]}
         done.append(s["name"])
@@ -1445,6 +1665,7 @@ def pristine():
 
 # ---------------------------------------------------------------- uninstall
 def uninstall():
+    lock_install()
     try:
         st = json.load(open(STATE))
     except Exception:
@@ -1460,17 +1681,28 @@ def uninstall():
     for name, si in bak["sites"].items():
         at, orig = si["addr"], bytes.fromhex(si["orig"])
         out, err, rc = wmx("remap", hex(at & ~0x3FFF), str(at & 0x3FFF), orig.hex())
-        wmx("prot", hex(at & ~0x3FFF), hex(0x4000), "rx")
+        if rc != 0:
+            bad.append("%s: remap failed: %s" % (name, (out or err).strip()))
+            continue
+        out, err, rc = wmx("prot", hex(at & ~0x3FFF), hex(0x4000), "rx")
+        if rc != 0:
+            bad.append("%s: prot rx failed: %s" % (name, (out or err).strip()))
         if rb(at, len(orig)) != orig:
-            bad.append(name)
+            bad.append("%s: bytes at %#x are not the on-disk image's" % (name, at))
+    # Free nothing until *every* branch is gone.  The island is handed back below as a writable,
+    # non-executable page; doing that while one site still holds a `b` into it is an instruction
+    # abort inside WindowManager the next time that site runs -- the failure mode of issue #19.
+    # A partial restore therefore stays allocated, names the site that failed, and is retried by
+    # the next stop instead of being silently turned into a trap.
+    if bad:
+        print("restore INCOMPLETE: %s" % "; ".join(bad))
+        raise Refuse("refusing to free the payload while a site may still branch into it: %s"
+                     % "; ".join(bad))
     wmx("dealloc", hex(st["body"]), hex(st["size"]))
     wmx("dealloc", hex(st["island"]), hex(0x4000))
     if wmx("allocat", hex(st["island"]), hex(0x4000))[2] == 0:
         wmx("prot", hex(st["island"]), hex(0x4000), "none")
-    print("restored %s%s" % (", ".join(bak["sites"].keys()),
-                             ("  FAILED: " + ",".join(bad)) if bad else "  (verified byte-exact)"))
-    if bad:
-        return 1
+    print("restored %s  (verified byte-exact)" % ", ".join(bak["sites"].keys()))
     os.unlink(STATE)
     return 0
 

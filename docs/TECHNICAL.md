@@ -44,9 +44,31 @@ menu-bar app ──► wmship.sh ──► install.py ──► task_for_pid(Win
   enough to the patched sites for a direct branch. It contains no file I/O and no Objective-C
   dispatch; all communication happens through a page that the tool reads and writes over the task
   port.
-- **The daemon** re-applies the patch after `WindowManager` restarts or after an OS update. It runs
-  the full doctor check before every attempt and stays disarmed, with a logged reason, if the check
-  refuses.
+- **The daemon** re-applies the patch after an OS update. It runs the full doctor check before
+  every attempt and stays disarmed, with a logged reason, if the check refuses. A `WindowManager`
+  that *disappears while armed* is different: the daemon records a crash — the pid it was armed on,
+  the pid that replaced it (or none), and the last mutating operation the tool performed, which
+  `install.py` writes to `/tmp/wmship/last_op.json` *before* each operation — and then stays down.
+  It does not re-arm: a machine cannot decide on its own that a process which died under the patch
+  is safe to patch again. A human `doctor` (or `start`) clears the block.
+
+### Memory the patch owns
+
+The payload is one 16 KB island page taken from a dead page near the patched code and one
+anonymous body. Every site we install is one branch away from the island, so the island must be
+**executable** before the first site is patched, and the body must be executable where the island
+branches into it. The installer therefore runs a self-test on the exact write path before it
+touches a live site: write the stubs, set the page `r-x`, read it back byte for byte, and check the
+live protection of the island, the body's code and its data region. Anything else is a named
+refusal. `wrmem()` refuses to write a page that is not already writable, so the helper's own
+fallback (which makes a page writable and leaves it that way) is never reached; every `remap` and
+`prot` return code is checked; each patched site's page is verified `r-x` after it is patched; and
+`uninstall` frees nothing until every site has been restored and verified, because handing the
+island back while a `b` still points into it is an instruction abort inside `WindowManager`, not a
+tool error. `wmship/selftest.py` proves the guard and reproduces the fault signature (a write or a
+fetch against a page without the right protection is `SIGBUS`/`KERN_PROTECTION_FAILURE`) without
+root and without a task port. One install at a time is enforced with a lock: two concurrent
+installs invalidate each other, and the way they do it is that same instruction abort.
 
 ## Capabilities
 
@@ -91,10 +113,24 @@ that magnification into every later scale — the error is a few percent and loo
 rather than a teaching bug.
 
 The keeper therefore waits for the end of an animation burst and keeps the value the pose settles
-on, and it gates teaching on four conditions: a complete and fresh state document (`flush` and
-`rail_now` present), the strip actually on screen, scale at 1.0, and the write not being its own.
-Retract and departure poses are refused geometrically so a hide can never be mistaken for a rest.
-When the strip leaves the screen its bases are discarded.
+on, and it gates teaching on three conditions: a complete and fresh state document (`flush` and
+`rail_now` present), the strip actually on screen, and scale at 1.0. Retract poses are refused
+geometrically so a hide can never be mistaken for a rest. When the strip leaves the screen its
+bases are discarded. The write being its own is deliberately *not* a gate: after a replay the
+resting pose is byte-identical to our own last write, so excluding `ours` made teaching fail
+whenever strip-on-top had run first (measured: `learn 0` across a whole teach sweep, `bases 0`,
+`resize` a no-op).
+
+**Two poses, not one.** A tile carries a *resting base* and a *replay transform*, because the two
+capabilities want opposite things from a pose and coupling them made one regress whenever the other
+was fixed. The base is strict — it is the pose the WindowManager wrote and then stopped writing,
+which is the only thing that may be scaled. The replay transform only has to keep the tile drawn,
+so it is taught from looser candidates (any settled write while the strip is on screen, at any
+scale) and it is what strip-on-top puts back. On-top therefore works for a tile that has never been
+taught a resting base, which is what a tightened teach gate used to break: measured 6/6 tiles at
+layer 3 above a flush window in three trials with `bases 0`, and again 6/6 in three trials with
+thirteen bases. Both are *promoted* after 0.22 s of silence rather than captured per write — a
+retract is a run of animation frames that would otherwise be followed into the hidden pose.
 
 Two invariants matter when touching this code. Poses are stored as raw bytes, so comparisons must
 cast to `double` before reading the scale entry; comparing the byte array directly compares one

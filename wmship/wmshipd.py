@@ -37,6 +37,8 @@ LOG = D + "/daemon.log"
 ST = D + "/daemon.json"
 STATE = D + "/state.json"
 MAP = D + "/map.txt"
+LASTOP = D + "/last_op.json"       # written by install.py next to every mutating wmx operation
+CRASH = D + "/crash.json"          # this daemon's record; cleared only by a human `doctor`
 
 _stop = False
 helper = None
@@ -135,6 +137,48 @@ def site_check():
     return rc == 0, (out or err).strip().split("\n")[-1]
 
 
+def last_op():
+    """The last mutating operation the tool performed, from install.py's own log.
+
+    A crash in WindowManager cannot be reported by the payload (it is the payload's host), so the
+    operation log is the evidence: written *before* each operation precisely so a fatal one is in
+    it."""
+    try:
+        return json.load(open(LASTOP))
+    except Exception:
+        return {}
+
+
+def crash_block():
+    try:
+        c = json.load(open(CRASH))
+        return c if c.get("blocking") else None
+    except Exception:
+        return None
+
+
+def record_crash(pid_from, pid_to, why):
+    op = last_op()
+    rec = {"blocking": True, "t": time.time(), "from": pid_from, "to": pid_to, "why": why,
+           "last_op": op, "last_op_age_s": round(time.time() - op["t"], 1) if op.get("t") else None}
+    try:
+        with open(CRASH, "w") as f:
+            json.dump(rec, f, indent=1)
+    except Exception:
+        pass
+    log("CRASH RECORDED WindowManager %s -> %s (%s); last operation %r, %s s before; "
+        "STAYING DISARMED until a human runs doctor"
+        % (pid_from or "?", pid_to or "?", why, op.get("op"), rec["last_op_age_s"]))
+    return rec
+
+
+def block_reason(rec):
+    op = (rec.get("last_op") or {}).get("op") or "unknown"
+    return ("WindowManager exited unexpectedly (%s -> %s) while armed. Last operation: %s. "
+            "Not re-arming: run `doctor` (or `start`) to clear and re-apply."
+            % (rec.get("from") or "?", rec.get("to") or "?", op))
+
+
 def on_signal(sig, frame):
     global _stop
     _stop = True
@@ -161,21 +205,40 @@ def main():
     while not _stop:
         pid = wm_pid()
         if not pid:
-            if applied:
-                log("WindowManager gone")
+            if armed or applied:
+                # the patch died with the process: there is no clean stop to be had, and the pid
+                # we were armed on is gone, so nothing this daemon does next can be trusted blind
+                if not crash_block():
+                    record_crash(applied, 0, "WindowManager not running while armed")
                 stop_helper()
             applied, armed, fails = 0, False, 0
             publish(state="disarmed", wm_pid=0, armed=False, reason="WindowManager not running")
             time.sleep(0.5)
             continue
         if pid != applied:
+            blk = crash_block()
+            if blk:
+                # a human has not cleared the crash yet: say so and do not touch WindowManager
+                if armed:
+                    stop_helper()
+                applied, armed = 0, False
+                publish(state="disarmed", wm_pid=pid, armed=False, crash=True,
+                        reason=block_reason(blk))
+                time.sleep(2.0)
+                continue
+            if armed and applied:
+                # the pid changed under us without a `stop`: WindowManager died and launchd
+                # brought a fresh one up.  Record it with the last operation, then stay down.
+                record_crash(applied, pid, "pid changed while armed; no clean stop")
+                stop_helper()
+                applied, armed = 0, False
+                publish(state="disarmed", wm_pid=pid, armed=False, crash=True,
+                        reason=block_reason(crash_block() or {}))
+                time.sleep(2.0)
+                continue
             # never patch blind: doctor resolves and validates every site, and verifies the
-            # object-layout profile against this very process, before anything is written.
-            # `--mode pristine` is explicit: this gate runs because the WindowManager is *new*
-            # (pid != the installed pid), so the sites must be the shipped image's own bytes.
-            # Auto-selection would give the same answer today; pinning it keeps the daemon's
-            # refusal semantics from drifting if an install ever survives a pid change.
-            rc, out, err = run([INSTALL, "doctor", "--json", "--mode", "pristine"], 300)
+            # object-layout profile against this very process, before anything is written
+            rc, out, err = run([INSTALL, "doctor", "--json"], 300)
             if rc != 0:
                 fails += 1
                 try:
