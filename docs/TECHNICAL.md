@@ -27,9 +27,9 @@ bypasses: with SIP enabled, `task_for_pid` against a platform binary is refused 
 ## Architecture
 
 ```
-menu-bar app ──► wmship.sh ──► install.py ──► task_for_pid(WindowManager)
-                    │             │
-                    │             └─ payload.c  (compiled, copied into the process)
+menu-bar app ──► wmship.sh ──► bin/asroot ──► install.py ──► task_for_pid(WindowManager)
+                    │              (verbs)        │
+                    │                             └─ payload.c  (compiled, copied into the process)
                     │
                     ├─ ctl.py      capability commands over the payload's control page
                     └─ wmlocate.py resolves the six sites from binary content
@@ -52,23 +52,94 @@ menu-bar app ──► wmship.sh ──► install.py ──► task_for_pid(Win
   It does not re-arm: a machine cannot decide on its own that a process which died under the patch
   is safe to patch again. A human `doctor` (or `start`) clears the block.
 
+### The privileged helper
+
+The only path to root is `bin/asroot`, and it is a **fixed verb dispatcher, not a shell** (#10, #24,
+#29). It parses its own `argv`, refuses anything it does not implement, execs `/usr/bin/python3`
+with a fixed `PATH` and `HOME`, accepts no stdin, and derives every path from its own real location
+(plus the fixed `/tmp/wmship` runtime directory) rather than from `argv` or the environment.
+
+Its verbs:
+
+```
+doctor [--json] [--no-live] [--mode pristine|armed|auto]
+status [--json]   pristine   install   uninstall   log   counters   probe
+selfcheck   teach   daemon-load|arm   daemon-unload|disarm   daemon-status
+remove-state   teardown [--keep-state]
+move <stage> [--cgid N]   resize <0.4..1.5> [--teach]   level <0|3>   cfg [<json>]
+warm | measure | state | poses
+```
+
+Arguments are validated by shape before they reach a tool: a scale is numeric and inside 0.4–1.5, a
+stage is printable and shell-metacharacter-free, a window id is decimal, a `cfg` document is a JSON
+object under 8 KiB. There is no `-c`: the three legacy `-c` shapes the shipped app still sends
+(`true`, `install.py status --json`, `install.py cfg '<json>'`) are matched as exact strings and
+nothing else in that space is accepted. Adding a capability means adding a verb, not widening an
+argument.
+
+`./scripts/selftest.sh` enforces this on the built bundle: it fails on a `-c` passthrough or a
+direct `install.py`/`ctl.py` call in the shipped shell scripts, checks that every verb
+`wmship.sh` calls exists in `asroot --verbs`, and checks the verbs the Swift app calls directly.
+
+### `doctor`: two modes
+
+`doctor` makes one of two disjoint sets of assertions, and never silently downgrades one to the
+other (#6):
+
+- **`pristine`** — nothing of ours is installed. Every site must still hold the on-disk image's own
+  bytes, and the object-layout profile must verify against the running process. This is the strict
+  mode.
+- **`armed`** — `state.json` describes the running WindowManager, and every site holds the stub
+  bytes recorded in `backup.json`; each stub lands inside the recorded island; the running body is
+  the payload image on disk, with the relocated symbol table masked out of both digests.
+
+`--mode pristine|armed|auto` selects explicitly. `auto` is the default and follows `state.json`'s
+pid. An explicit mode the state cannot support is a refusal: asking for `armed` when nothing of
+ours is installed fails instead of falling back to `pristine`, because that downgrade would turn
+"our patch is inconsistent" into a pass. With `--json`, `doctor` is read-only — that is the shape the
+daemon calls, so it can never clear a crash. A human run (no `--json`) clears the daemon's crash
+marker on success by unlinking `crash.json`; that is the deliberate way a machine's crash block is
+released. `--wm-binary` validates a copy and can only be pristine.
+
+The daemon's re-apply gate is deliberately the pristine case: it installs only when the running
+WindowManager is not the one `state.json` describes (a new pid, after a restart or an OS update),
+so auto resolves to `pristine` and the comparison is against the on-disk image. It never validates
+— and therefore never arms over — its own live patch.
+
 ### Memory the patch owns
 
 The payload is one 16 KB island page taken from a dead page near the patched code and one
-anonymous body. Every site we install is one branch away from the island, so the island must be
+anonymous body. Every installed site is one branch away from the island, so the island must be
 **executable** before the first site is patched, and the body must be executable where the island
-branches into it. The installer therefore runs a self-test on the exact write path before it
-touches a live site: write the stubs, set the page `r-x`, read it back byte for byte, and check the
-live protection of the island, the body's code and its data region. Anything else is a named
-refusal. `wrmem()` refuses to write a page that is not already writable, so the helper's own
-fallback (which makes a page writable and leaves it that way) is never reached; every `remap` and
-`prot` return code is checked; each patched site's page is verified `r-x` after it is patched; and
-`uninstall` frees nothing until every site has been restored and verified, because handing the
-island back while a `b` still points into it is an instruction abort inside `WindowManager`, not a
-tool error. `wmship/selftest.py` proves the guard and reproduces the fault signature (a write or a
-fetch against a page without the right protection is `SIGBUS`/`KERN_PROTECTION_FAILURE`) without
-root and without a task port. One install at a time is enforced with a lock: two concurrent
-installs invalidate each other, and the way they do it is that same instruction abort.
+branches into it.
+
+The crash class behind #19 is an **instruction fetch**, not a bad matrix. Both reports had the
+program counter equal to the faulting address inside a 16 KB page that was `rw-` with `max rwx`:
+writable, not executable. A process cannot produce that state for itself (the kernel denies a
+`W|X` mapping), so it came through a task port — our island, in the window between `allocat`, which
+leaves it writable, and `prot … rx`. That window is dangerous only while a branch can already
+reach the page, which means a second install interleaving with the first, or a partial uninstall
+re-allocating the island under a live site. The fixes close the window rather than trusting a
+retry:
+
+- `wrmem()` refuses a page that is not already writable, so the helper's fallback (which makes a
+  page writable and leaves it that way) is never reached, and every `remap`/`prot` return code is
+  checked.
+- Before a single live site is patched, the installer runs `island_selftest` on the exact write
+  path: write the stubs, set the island `r-x`, read it back byte for byte, and check the live
+  protection of the island, the body's code and its data region.
+- Each patched site's page is verified `r-x` after it is patched.
+- `uninstall` frees nothing until every site is restored and verified: handing back a page that a
+  `b` still targets is the same instruction abort.
+- An install lock makes two installers refuse each other rather than interleave; the loser would
+  otherwise re-allocate the island under the winner's branches.
+- The daemon records an unexpected WindowManager exit with the last mutating operation (written to
+  `last_op.json` *before* the operation) and stays disarmed. It does not re-arm; a human `doctor`
+  or `start` clears the block.
+
+`wmship/selftest.py` proves the guard and reproduces the signature without root and without a task
+port: a write or a fetch against a page without the right protection is `SIGBUS` /
+`KERN_PROTECTION_FAILURE`, and the guard refuses the page state the crash reports describe.
 
 ## Capabilities
 
@@ -92,13 +163,28 @@ current scale onto every pose the WindowManager emits, which catches tiles that 
 a stage change.
 
 Scaling needs a baseline, and the WindowManager never offers one: it emits a transform only when
-something changes. So `resize` begins with a **teach pass** — a pointer sweep across every tile with
-scaling disabled, which makes the WindowManager emit each tile's animation in and back out again. The
-value the return animation settles on is that tile's resting pose, and it is stored as the base for
-all later scaling. A single tile costs about a second: roughly 250 ms of animation in, a dwell, about
-300 ms back out, and a settle. Seven tiles, two passes, one teach pass and a verification pass is why
-one `resize` invocation takes a minute or two, and why the pointer moves while it runs. It is waiting
-for animations to finish, not computing.
+something changes. So the first `resize` after a layout change begins with a **teach pass** — a
+pointer sweep across every tile with scaling disabled, which makes the WindowManager emit each
+tile's animation in and back out again. The value the return animation settles on is that tile's
+resting pose, and it is stored as the base for all later scaling. A single tile costs about a
+second: roughly 250 ms of animation in, a dwell, about 300 ms back out, and a settle. That
+animation time, not computation, is why a teach pass over a full strip takes a minute or two and
+why the pointer moves while it runs. Once the bases are known, `resize` reuses them and does only
+a measurement sweep (`resize --teach` or `wmship.sh teach` forces a fresh pass).
+
+**Preflight: `selfcheck`.** Before offering resize, `ctl.py selfcheck` asks whether the teach state
+can actually be measured. Measuring at rest cannot answer that: at `s = 1.0` the WindowManager
+draws its own resting pose, so `width / natural` reads 1.000 whatever the taught base is. The probe
+therefore applies a known scale of **1.2** with teaching off, forces one write-triggering sweep,
+and demands every tile read `1.2 × natural` within 2%. A base taught from a hover lift reads
+`1.2 × 1.06` and fails. The caller's scale is then restored and measured again, so the check cannot
+leave the strip somewhere else. It never teaches. The probe is visible: the strip scales to 1.2 for
+a few seconds and back.
+
+`selfcheck` is available as `wmship.sh selfcheck` (and the helper's `selfcheck` verb). The app runs
+it when the popover opens and withholds the size slider until it passes (#35); the pass path on a
+live armed install has not been observed, so that gate is implemented and unit-tested but still an
+owner check.
 
 ### The strip keeper
 
@@ -114,35 +200,75 @@ rather than a teaching bug.
 
 The keeper therefore waits for the end of an animation burst and keeps the value the pose settles
 on, and it gates teaching on three conditions: a complete and fresh state document (`flush` and
-`rail_now` present), the strip actually on screen, and scale at 1.0. Retract poses are refused
+`rail_now` present), the strip genuinely drawn (tiles in the gutter, a non-flush front window), and
+scale 1.0. A strip-transition hold also suppresses teaching. Retract poses are refused
 geometrically so a hide can never be mistaken for a rest. When the strip leaves the screen its
 bases are discarded. The write being its own is deliberately *not* a gate: after a replay the
 resting pose is byte-identical to our own last write, so excluding `ours` made teaching fail
 whenever strip-on-top had run first (measured: `learn 0` across a whole teach sweep, `bases 0`,
 `resize` a no-op).
 
-**Two poses, not one.** A tile carries a *resting base* and a *replay transform*, because the two
-capabilities want opposite things from a pose and coupling them made one regress whenever the other
-was fixed.
+**Two poses, not one.** A tile carries a *resting base* (`base`) and a *replay transform* (`rp`).
+They are not interchangeable: `base` is the only pose `resize` may scale, and `rp` is what
+strip-on-top replays.
 
-- The **base** is the only thing that may be scaled, and it is strict: the pose the WindowManager
-  wrote, then stopped writing, *and* the largest first scale entry (`m0`) the tile shows.
-- The **replay transform** only has to keep the tile drawn, so it is taught from looser candidates —
-  any settled write while the strip is on screen, at any scale — and it is what strip-on-top puts
-  back. On-top therefore works for a tile that has never been taught a resting base, which is what a
-  tightened teach gate used to break: measured 6 of 6 tiles at layer 3 above a flush window in three
-  trials with no base at all, and again in three trials with bases present.
+- `base` is strict. It is taught only at scale 1.0, while the strip is genuinely drawn (fresh
+  document, `rail_x >= 0`, front window not flush) and outside a strip-transition hold, never from
+  a retract pose, and never from a pose whose `m0` is smaller than the base already held. It is the
+  **largest** first scale entry the tile shows. `m0` is `natural / drawn`, so a hover lift — the
+  tile drawn a few percent larger — is the *smaller* value (measured: 1.883 at rest, 1.775
+  lifted). Without that rule `resize 1.5` renders `1.5 × lift`; with it, a parked-pointer trial
+  moved from 1.607 on the parked tile to 1.493.
+- `rp` is looser by design: any write that is not ours and not the identity, while the document
+  says the strip is drawn, becomes a candidate. It needs no taught base, which is what makes
+  on-top work for a tile that has never been taught: measured 6 of 6 tiles at layer 3 above a
+  flush window in three trials with zero bases, and again in three trials with thirteen.
 
-"Stopped writing" alone is not enough for a base. A pointer that comes to rest on a tile lifts it,
-and then the WindowManager is silent — which is exactly the shape of a settle. `m0` is
-`natural / drawn`, so a lift is the *smaller* value and the resting pose is the largest; without that
-test `resize 1.5` renders `1.5 × lift`. Measured with a pointer parked on one tile: 1.607 for that
-tile against 1.490–1.500 for the rest before the test, 1.493 after it. A base also describes the
-drawing that is on screen *now*, so it is dropped when the strip leaves: a layout change arrives
-through a hide, and the next teach pass starts from an empty base instead of being pinned to a pose
-from a drawing that no longer exists. Both poses are *promoted* after 0.22 s of silence rather than
-captured per write — a retract is a run of animation frames that a per-write rule would follow into
-the hidden pose (measured: six tiles replayed at the retracted pose and never came back).
+Both are **promoted, not captured**: a candidate becomes the pose only after 0.22 s in which the
+WindowManager wrote nothing else for that window, and only while the document still says the strip
+is drawn. The margins are measured. The longest gap *inside* one animation is 0.13 s, so a
+mid-animation frame is always superseded before the 0.22 s expires; the post-rest silence is at
+least 0.3 s or no write follows at all; the document is republished every ~25 ms; and a retract is
+~0.3 s of writes, so the last retract frame cannot be both quiet for 0.22 s and still described as
+drawn. A per-write rule did follow the retract into the hidden pose (measured: six tiles replayed
+at the retracted pose and never came back), which is why promotion exists; `rp` also refuses a
+candidate written before the strip last came out.
+
+`base` is dropped when the strip leaves — a base describes the drawing that is on screen now, and
+a layout change arrives through a hide — while `rp` survives, because on-top has to redraw across
+that hide.
+
+## The app
+
+The menu-bar app is a thin client: every privileged action still goes through the helper and
+`wmship.sh`, and the app itself owns no privilege. Three features are new on this build. Their
+decision logic is unit-tested; none of their live paths has been exercised against an armed
+WindowManager, so they are labelled accordingly below.
+
+**Diagnostics panel.** A disclosure in the popover shows armed state, build and pid, the `doctor`
+verdict with its first refusal, the keeper counters, and the last resize as natural → measured →
+ratio per tile. The counters come from the helper's `counters` verb (`install.py counters`,
+root-only) because `status --json` carries only the aggregate five; if the verb fails the panel
+shows the reason instead of dashes. "Copy diagnostics" renders a paste-ready block and redacts home
+and temporary paths. *Unit-tested: the block's formatting and redaction. Unverified: live refresh
+against a running daemon.*
+
+**Modifier + scroll resize.** An event tap consumes a scroll only while the configured chord is
+held and the pointer is inside the strip's rect read from the accessibility tree; every other
+scroll passes through. The default chord is **Control + Option** (Option + scroll alone is zoom in
+several apps). The value is clamped to 0.4–1.5, snapped to exactly 1.0 within 2%, limited to one
+step per 16 ms, and written straight into the payload config (`cfg_gen`) — not through the
+sweep-based `resize`. A HUD next to the strip shows the percentage. *Unit-tested: chord matching,
+clamp, snap, the accumulator that keeps the snap zone passable, rate limit. Unverified: the tap and
+HUD against live WindowManager geometry and input permissions.*
+
+**Drag onto a tile.** The same tap records the window under a mouse press and, on release inside
+the strip, re-reads tile frames at release time (the strip animates during the drag) and hit-tests
+the release point. Exactly one tile under the point moves the captured window with
+`move <stage> --cgid N`. A point outside the strip, the empty gutter, two overlapping tile frames,
+or a press on a system-owned window (the strip itself, the Dock) does nothing; ambiguity is counted,
+not guessed. Mouse events always pass through, so native drag-out is untouched. *Unit-tested: the
+hit-test and its four decisions. Unverified: a live drag onto WindowManager tiles.*
 
 ## State channel
 
@@ -184,13 +310,22 @@ future macOS can invalidate. What matters is whether a break is loud or quiet.
 | SkyLight transform and level calls | private API changes | **quiet**: strip-on-top and resize stop applying |
 | Tiles emit transforms on pointer movement | emission changes | **quiet**: sweeps produce nothing, resize does nothing |
 | Hover animation shape (burst length, settle value) | timing or easing changes | **quiet**: bases are wrong by a few percent |
-| The scale pivot (`16, 490` — a point in the strip gutter) | display size or strip position changes | **quiet**: tiles scale about the wrong point |
+| The scale pivot (`16, 490` — a point in the strip gutter) | display size or strip position changes | **quiet**: tiles scale about the wrong point ([multi-display](RESEARCH-multi-display.md)) |
 | Fixed settle windows (300–500 ms) | slower or faster animations | **quiet**: teaching reads a mid-animation pose |
 
 The quiet ones are the reason the resize path verifies every tile against a freshly measured natural
-size and reports per-tile ratios instead of a single boolean. They are also the reason the keeper
-keeps a trace: with `cfg trace=true` the payload publishes each decision (`m0`, base value, and the
-retract/departure/lift verdicts), so a wrong ratio can be diagnosed without a debugger.
+size and reports per-tile ratios instead of a single boolean. They are also why the keeper is meant
+to publish a decision trace — `m0`, the base value, and the retract/departure/lift verdicts — so a
+wrong ratio can be diagnosed without a debugger. That trace is **not in this payload build**:
+`payload.c` parses no `trace` key (#31). The app's toggle is deliberately inert — it is permanently
+disabled with a note and writes nothing, because #25 removed `ConfigChange.trace` and
+`PayloadConfig.trace` — and `wmship.sh` has no trace verb. #31 is what would make the key real.
+Until it lands, the evidence is `wmship.sh poses` (the pose table), `wmship.sh counters`, and the
+per-tile ratios from `resize`.
+
+The display assumptions are also unmeasured beyond one built-in display; what the code assumes and
+the measurements that would replace those assumptions are in
+[docs/RESEARCH-multi-display.md](RESEARCH-multi-display.md).
 
 Known weak points, in the order they are worth hardening:
 
@@ -198,16 +333,22 @@ Known weak points, in the order they are worth hardening:
    so a different display or a moved strip cannot scale about the wrong point.
 2. **Settle windows are time-based.** Replacing them with "the value has stopped changing" would
    remove the timing assumption entirely.
-3. **No preflight for resize.** A single-tile sweep that measures one ratio and reports it would turn
-   a quiet mis-measure into a refusal before the UI offers the control.
+3. **The resize preflight is a measurement, not a repair.** `selfcheck` applies a 1.2 probe with
+   teaching off, requires every tile within 2%, then restores the caller's scale. The app runs it
+   when the popover opens and withholds the size slider until it passes (#35); the pass path on a
+   live armed install still needs owner verification. It cannot fix a wrong base — only
+   `wmship.sh teach` re-learns the bases.
 
 ## Performance
 
-- Window creation to injection: 58–72 ms, no debugger attached.
+- Window creation to injection: 58–72 ms, no debugger attached. This is the injection cost; the
+  end-to-end birth capability did not reproduce on the last attempt (see Verification).
 - Per-tile transform replay: the WindowManager's own transaction API, no polling loop in the target.
 - The payload contains no timers; it acts only when the patched code runs.
 - A resize teach-and-measure pass is dominated by animation time, not work: roughly one second per
   tile, so a full `resize` is a minute or two.
+- `selfcheck` costs two short sweeps (probe and restore); the strip is visibly at 1.2 for a few
+  seconds.
 
 ## Approaches evaluated
 
@@ -218,7 +359,8 @@ Known weak points, in the order they are worth hardening:
 | Accessibility actions on tiles | Switch stages; do not assign windows |
 | Attaching a debugger | Works, but adds latency to every hit and leaves a debugger resident |
 | In-memory payload, read-only outside | Chosen: no debugger, no disk changes, reversible on stop |
-| Synthetic gesture input for resize | No supported way to create the magnification event; drive the transform directly instead |
+| Synthetic gesture input for resize | No supported way to create the magnification event; drive the transform directly instead ([pinch research](RESEARCH-pinch.md)) |
+| Deriving the pose from a measured frame | Not viable: the frame is the drawn frame, the translation is not in screen coordinates, and there is no event to calibrate against — teaching stays ([docs/GEOMETRY.md](GEOMETRY.md)) |
 
 ## Keeping up with a new macOS build
 
@@ -227,11 +369,13 @@ Known weak points, in the order they are worth hardening:
    it to `profile.json` under the new build key.
 3. If a site no longer matches, update `wmlocate.py`'s structural signature. Prove it against a
    shifted copy of the binary, and against corrupted copies that must refuse.
-4. Re-derive the scale pivot if the strip's geometry changed (see Fragility) rather than trusting the
-   constant.
-5. Confirm the pose stream still behaves as the keeper assumes: with `cfg trace=true`, a hover should
-   produce a burst that returns to a settled value, and a hide should translate without changing the
-   scale entry. If either is untrue, the teach pass needs revisiting before resize can be trusted.
+4. Re-derive the scale pivot if the strip's geometry changed (see Fragility and
+   [multi-display](RESEARCH-multi-display.md)) rather than trusting the constant.
+5. Confirm the pose stream still behaves as the keeper assumes. There is no trace yet (#31); use
+   `wmship.sh poses` for the pose table and `wmship.sh warm` to make the WindowManager re-emit.
+   A hover should produce a burst that returns to a settled value, and a hide should translate
+   without changing the scale entry. If either is untrue, the teach pass needs revisiting before
+   resize can be trusted.
 6. Rebuild the payload, then verify: births, move, strip on top, resize. Numbers, not impressions.
 
 ## Verification
@@ -240,3 +384,15 @@ Capability checks are numeric and reversible: window layers and per-tile geometr
 list, stage membership from the process's accessibility tree, and a byte-exact comparison of every
 patched site against the on-disk image after `stop`. Tests avoid synthetic input and never rearrange
 the user's stages.
+
+What has actually been exercised, and what has not, on the current tree:
+
+| area | status |
+|---|---|
+| Site resolution, install/restore, crash guards | exercised without root by `wmship/selftest.py`; bundle invariants by `./scripts/selftest.sh`; install and restore exercised on the owner's machine |
+| Strip-on-top | owner-verified: 6/6 tiles at layer 3 above a flush window, three trials with zero taught bases and three with thirteen, still out 2 s later |
+| Resize | owner-verified: every tile 1.490–1.500 at 1.5 and 0.600–0.612 at 0.6, exact restore of x/y/w/h |
+| Births | implemented, **unverified end-to-end**: the last two attempts injected nothing (`inject=0`) and the window became a strip tile |
+| `selfcheck` | logic and app gate unit-tested (#35); the pass path on a live armed install has not been observed — owner check |
+| App diagnostics, gesture resize, drop-to-tile | decision code unit-tested; live paths **not exercised** against an armed WindowManager |
+| Pose trace | **absent** from this payload build (#31); the app's control is permanently disabled and writes nothing |
