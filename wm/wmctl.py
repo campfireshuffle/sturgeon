@@ -349,14 +349,18 @@ def wait_gen(gen, t=4.0):
     return False
 
 
-def force_writes():
+def force_writes(passes=2):
     """Hover every stage tile so the WM re-emits its per-tile 4x4.  The keeper composes the
     current cfg (scale, replay pose, level) onto that very write, so no debugger interrupt is
-    needed - which is what used to be able to wedge lldb."""
+    needed - which is what used to be able to wedge lldb.
+
+    `passes=2` is the teaching sweep: a base is the pose an animation *settles* on, so the tile has
+    to be visited, left and given time to come back.  A measurement sweep only needs every tile to
+    be written once (`passes=1`); `ctl.py resize` uses that and re-sweeps if a tile did not take."""
     skip = ("WindowManager", "Window Server", "Dock", "Notification Center",
             "CursorUIViewService")
     n = 0
-    for _pass in range(2):
+    for _pass in range(max(1, int(passes))):
         apps = [w for w in probe_wins() if w.get("owner") not in skip
                 and 0 <= w["x"] < 320 and 8 <= w["w"] <= 330 and 8 <= w["h"] <= 560]
         for a in apps:

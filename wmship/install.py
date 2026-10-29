@@ -1,8 +1,14 @@
 #!/usr/bin/python3
 """install.py — install / doctor / status / uninstall the Stage Manager payload with no debugger.
 
-    doctor [--wm-binary PATH] [--json]   resolve every site, validate it live, refuse if anything
-                                        is unresolved, ambiguous or does not match the build
+    doctor [--wm-binary PATH] [--json] [--mode pristine|armed]
+                                        resolve every site and validate it live, in one of two
+                                        explicit modes: a pristine WindowManager (every site still
+                                        holds the on-disk image's bytes) or our own armed install
+                                        (every site holds the stub recorded in backup.json, each
+                                        stub lands in the recorded island, and the running body is
+                                        the payload image on disk).  Refuses if anything is
+                                        unresolved, ambiguous or inconsistent.
     pristine                             every site still holds the on-disk image's own bytes
     install                              doctor, then allocate + write + patch the six sites
     status                               build, armed/disarmed, capabilities, debugger, helper
@@ -19,6 +25,7 @@ the payload needs (the WindowID / WindowIDTable class metadata) come from the bu
 is written: the profile's isa must agree with the WM's own table serials, and its ivar-offset
 globals must read as small aligned offsets.  A profile that does not verify is a refusal.
 """
+import hashlib
 import json
 import os
 import shlex
@@ -161,6 +168,14 @@ def load_profile(key):
     except Exception:
         return None
     return (d.get("builds") or {}).get(key)
+
+
+def _json_file(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- words / memory helpers
@@ -359,12 +374,159 @@ def image_text_range(macho):
     return t["addr"], t["addr"] + t["size"]
 
 
-def doctor(wm_binary=None, live=None, as_json=False):
-    """Resolve all six sites, validate each one (in __TEXT, instruction class, cross-reference),
-    verify the build profile against the live process, and print a report.  Never writes."""
+# ---- issue #6: validating an *armed* install ------------------------------------------------
+# A healthy armed install deliberately differs from the on-disk image at exactly six places, so
+# comparing live bytes to `payload.img` (the pristine test) must fail on it.  The armed test is
+# not a relaxation of that one; it is a different set of assertions, all of which can be made
+# from the records the install itself wrote:
+#   * each site still holds the stub bytes recorded in backup.json
+#   * each recorded stub lands inside the recorded island page
+#   * the running body is the payload image on disk
+# The decoders below are the only non-obvious part, and they take bytes + address only, so the
+# comparison logic is unit-tested without a WindowManager (wmship/tests/test_cli_modes.py).
+
+def branch_target(word, pc):
+    """Target of a direct `b`/`bl` at `pc`, or 0 when the word is neither."""
+    if (word & 0x7C000000) != 0x14000000:
+        return 0
+    imm = word & 0x3FFFFFF
+    if imm & 0x2000000:
+        imm -= 0x4000000
+    return pc + imm * 4
+
+
+def stub_target(blob, addr):
+    """The island address a recorded site stub lands on.
+
+    The four __TEXT sites are replaced by a single direct `b` to their island stub; the two
+    keepers get a three-word `adrp x16 / add x16,x16 / br x16` because a direct branch from the
+    shared cache cannot reach a page near WindowManager.  Returns 0 for anything else."""
+    b = bytes(blob)
+    if len(b) == 4:
+        return branch_target(struct.unpack_from("<I", b)[0], addr)
+    if len(b) == 12:
+        w0, w1, w2 = struct.unpack_from("<III", b)
+        if (w0 & 0x9F00001F) != 0x90000010:          # adrp x16, #imm
+            return 0
+        if (w1 & 0xFFC003FF) != 0x91000210:          # add x16, x16, #imm12
+            return 0
+        if w2 not in (0xD61F0200, 0xD63F0200):       # br x16 / blr x16
+            return 0
+        imm = ((w0 >> 29) & 3) | (((w0 >> 5) & 0x7FFFF) << 2)
+        if imm & (1 << 20):
+            imm -= 1 << 21
+        return ((addr & ~0xFFF) + (imm << 12)) + ((w1 >> 10) & 0xFFF)
+    return 0
+
+
+ISLAND_SIZE = 0x4000
+
+
+def armed_site_checks(bak, read, island):
+    """Every recorded site must still hold its stub bytes, and the stub must land in the island.
+
+    `read(addr, n) -> bytes` is the only live dependency, so a test can pass a dictionary-backed
+    reader instead of the WindowManager.  The returned rows name the site in `check` and in the
+    failure detail (`<site>.stub-bytes: <site>`), which is what makes a corrupted stub an
+    actionable failure rather than a bare count."""
+    rows = []
+    lo, hi = int(island), int(island) + ISLAND_SIZE
+    recorded = (bak or {}).get("sites") or {}
+    for name in SITE_NAMES:
+        si = recorded.get(name)
+        if not si:
+            rows.append({"check": "%s.stub-recorded" % name, "ok": False,
+                         "detail": "backup.json has no entry for %s — reinstall" % name})
+            continue
+        want = bytes.fromhex(si["new"])
+        got = read(int(si["addr"]), len(want))
+        if got != want:
+            rows.append({"check": "%s.stub-bytes" % name, "ok": False,
+                         "detail": "site %s at %#x: live %s != recorded stub %s"
+                                   % (name, int(si["addr"]), got.hex() or "?", want.hex())})
+            continue
+        rows.append({"check": "%s.stub-bytes" % name, "ok": True,
+                     "detail": "site %s at %#x: %s" % (name, int(si["addr"]), want.hex())})
+        tgt = stub_target(want, int(si["addr"]))
+        stub = int(si.get("stub") or 0)
+        ok = bool(tgt) and tgt == stub and lo <= stub < hi
+        rows.append({"check": "%s.stub-target" % name, "ok": ok,
+                     "detail": "site %s stub %#x -> %#x (recorded %#x, island [%#x,%#x))"
+                               % (name, int(si["addr"]), tgt, stub, lo, hi)})
+    return rows
+
+
+def doctor_mode(requested, state, pid):
+    """Which set of assertions `doctor` must make.
+
+    `None` is auto and follows the state file: an install whose recorded pid is the running
+    WindowManager is armed.  An explicit mode the state cannot support is a refusal — silently
+    downgrading `armed` to `pristine` would turn "our patch is inconsistent" into "PASS"."""
+    if requested in ("pristine", "armed"):
+        if requested == "armed" and not (state and state.get("pid") == pid):
+            raise Refuse("doctor --mode armed: %s does not describe the running WindowManager "
+                         "(installed pid %s, running pid %s); nothing of ours is installed"
+                         % (STATE, (state or {}).get("pid"), pid))
+        return requested
+    return "armed" if state and state.get("pid") == pid else "pristine"
+
+
+def image_seal(disk, live, relocs, n):
+    """sha256 of two copies of an image with the relocated words masked out of both.
+
+    The body in the process is `payload.img` with the `_SL` symbol table overwritten with this
+    process's addresses, so a plain hash of the file can never equal a hash of the running body.
+    Masking the same spans (the ones install() writes into the image before copying it) leaves a
+    digest that is comparable across processes."""
+    def masked(buf):
+        b = bytearray(bytes(buf)[:n])
+        for off, ln in relocs:
+            if off < len(b):
+                b[off:off + ln] = b"\0" * min(ln, len(b) - off)
+        return bytes(b)
+    return hashlib.sha256(masked(disk)).hexdigest(), hashlib.sha256(masked(live)).hexdigest()
+
+
+def body_image_check(st, read):
+    """The body the WindowManager is running must be the payload image on disk.
+
+    Two independent facts: the payload on disk is unchanged since the install (`img_sha256` in
+    state.json), and the live body matches it outside the relocated symbol table."""
+    disk_sha = img_sha256()
+    was = st.get("img_sha256")
+    if was and disk_sha and was != disk_sha:
+        return False, ("payload.img changed since the install (installed %s, on disk %s) — "
+                       "reinstall to run the image that is on disk" % (was[:12], disk_sha[:12]))
+    try:
+        with open(W + "/payload.img", "rb") as f:
+            disk = f.read()
+    except Exception as e:
+        return False, "cannot read payload.img: %s" % e
+    try:
+        syms = st["syms"]
+        body = int(st["body"])
+    except Exception:
+        return False, "state.json has no body/syms — reinstall"
+    live = read(body, len(disk))
+    if len(live) != len(disk):
+        return False, "read %d of %d body bytes at %#x" % (len(live), len(disk), body)
+    relocs = st.get("relocs") or [[syms["_SL"], 8 * 32]]
+    a, b = image_seal(disk, live, relocs, len(disk))
+    if a == b:
+        return True, "body %#x == payload.img %s (symbol table masked)" % (body, a[:16])
+    return False, "body %#x is not payload.img: live %s, disk %s" % (body, b[:16], a[:16])
+
+
+def doctor(wm_binary=None, live=None, as_json=False, mode=None):
+    """Resolve all six sites, validate them against the code that is running, and print a report.
+
+    Two modes with two sets of assertions (issue #6): `pristine` — nothing of ours is installed —
+    and `armed` — state.json describes this WindowManager.  See `doctor_mode` for how the mode is
+    chosen.  Never writes."""
     from wmlocate import FatOrThin, SharedCache            # read-only Mach-O reader
     rep = {"ok": False, "build": None, "text_sha256": None, "sites": {}, "checks": [],
-           "refusals": [], "profile": None, "live": None, "foreign": None, "cache": None}
+           "refusals": [], "profile": None, "live": None, "foreign": None, "cache": None,
+           "mode": None}
 
     def chk(name, ok, detail=""):
         rep["checks"].append({"check": name, "ok": bool(ok), "detail": detail})
@@ -389,6 +551,10 @@ def doctor(wm_binary=None, live=None, as_json=False):
 
     target = wm_binary or WM_LIVE
     if wm_binary:
+        if mode == "armed":
+            rep["refusals"].append("doctor --mode armed: --wm-binary validates a copy, not this "
+                                   "process")
+            return _doctor_out(rep, as_json)
         try:
             alt = file_sites(wm_binary)
         except Refuse as e:
@@ -414,9 +580,21 @@ def doctor(wm_binary=None, live=None, as_json=False):
                                "file_va_hex": hex(alt["keepers"][k][0]),
                                "live_va": None, "live_checked": False}
         rep["ok"] = same and not rep["refusals"]
+        rep["mode"] = "pristine"
         return _doctor_out(rep, as_json)
 
     # 2. the live process, so every address is proven against the code that is running
+    f = find()
+    rep["live"] = {"pid": f["pid"], "slide": hex(f["slide"])}
+    do_live = True if live is None else bool(live)
+    try:
+        rep["mode"] = doctor_mode(mode, _json_file(STATE), f["pid"])
+    except Refuse as e:
+        rep["refusals"].append(str(e))
+        return _doctor_out(rep, as_json)
+    if rep["mode"] == "armed":
+        return _doctor_armed(rep, inst, f, chk, do_live, as_json)
+
     m0, _ = FatOrThin.open(target)
     cw0 = m0.words(inst["sites"]["compute"], 3)
     callee_file = bl_target(cw0[0], inst["sites"]["compute"]) if is_bl(cw0[0]) else 0
@@ -424,9 +602,6 @@ def doctor(wm_binary=None, live=None, as_json=False):
         rep["refusals"].append("compute site +0 in the image is not a bl")
         return _doctor_out(rep, as_json)
     chk("compute.callee-decoded", True, "%#x" % callee_file)
-    f = find()
-    rep["live"] = {"pid": f["pid"], "slide": hex(f["slide"])}
-    do_live = True if live is None else bool(live)
     m, _ = FatOrThin.open(target)
     lo, hi = image_text_range(m)
     slide = f["slide"]
@@ -547,6 +722,50 @@ def doctor(wm_binary=None, live=None, as_json=False):
     return _doctor_out(rep, as_json, inst=inst)
 
 
+def _doctor_armed(rep, inst, f, chk, do_live, as_json):
+    """The armed half of `doctor` (issue #6): every assertion is about our own install.
+
+    A site that has been restored under us, a stub that no longer lands in the island, and a body
+    that is not the payload image on disk are each a refusal that names what is wrong.  Nothing
+    here compares a patch site to the on-disk image: that comparison is the *pristine* test and it
+    must keep failing on a healthy armed install."""
+    st = _json_file(STATE) or {}
+    bak = _json_file(BAK) or {}
+    rep["armed"] = {"pid": st.get("pid"), "island": hex(int(st.get("island") or 0)),
+                    "body": hex(int(st.get("body") or 0)),
+                    "img_sha256": st.get("img_sha256")}
+    rep["profile"] = {"key": rep["key"], "present": bool(load_profile(rep["key"]))}
+    for k in SITE_NAMES:
+        fva = inst["sites"][k] if k in inst["sites"] else inst["keepers"][k][0]
+        si = (bak.get("sites") or {}).get(k) or {}
+        rep["sites"][k] = {"file_va": fva, "file_va_hex": hex(fva),
+                           "live_va": si.get("addr"), "live_checked": bool(do_live)}
+    if not do_live:
+        rep["refusals"].append("doctor --mode armed needs the live process (do not pass --no-live)")
+        return _doctor_out(rep, as_json, inst=inst)
+    island = int(st.get("island") or 0)
+    if not island or not bak.get("sites"):
+        rep["refusals"].append("%s or %s is missing or incomplete — reinstall" % (STATE, BAK))
+        return _doctor_out(rep, as_json, inst=inst)
+    chk("state.pid-is-live", st.get("pid") == f["pid"],
+        "installed under pid %s, live pid %s" % (st.get("pid"), f["pid"]))
+    # The recorded site addresses must be the ones this build resolves to *now*: that is what ties
+    # backup.json to this process, and the keeper slide is recomputed rather than trusted.
+    for k in SITE_NAMES:
+        si = bak["sites"].get(k) or {}
+        want = keeper_live(k, inst) if k.startswith("keeper") else inst["sites"][k] + f["slide"]
+        got = int(si.get("addr") or 0)
+        chk("%s.addr-agrees" % k, got == want, "backup %#x vs resolved %#x" % (got, want))
+    for c in armed_site_checks(bak, rb, island):
+        chk(c["check"], c["ok"], c["detail"])
+    ok, det = body_image_check(st, rb)
+    chk("payload.image", ok, det)
+    chk("profile.present", bool(rep["profile"]["present"]),
+        "layout profile for build %s" % rep["key"][:48])
+    rep["ok"] = bool(not rep["refusals"]) and all(c["ok"] for c in rep["checks"])
+    return _doctor_out(rep, as_json, inst=inst)
+
+
 def _doctor_out(rep, as_json, inst=None):
     if as_json:
         print(json.dumps(rep, indent=1, sort_keys=True))
@@ -555,6 +774,10 @@ def _doctor_out(rep, as_json, inst=None):
           % (rep.get("build"), (rep.get("text_sha256") or "")[:16], rep.get("cache")))
     if rep.get("live"):
         print("live pid %(pid)d  slide %(slide)s" % rep["live"])
+    if rep.get("mode") == "armed":
+        a = rep.get("armed") or {}
+        print("mode         armed  island %s  body %s  payload %s"
+              % (a.get("island"), a.get("body"), (a.get("img_sha256") or "?")[:12]))
     if rep.get("foreign"):
         fo = rep["foreign"]
         print("image        %s  build %s  __TEXT %s" % (fo["path"], fo["build"],
@@ -812,9 +1035,9 @@ def cleanup_orphans():
 
 def img_sha256():
     """Identity of the payload body the tree would install right now."""
-    import hashlib
     try:
-        return hashlib.sha256(open(W + "/payload.img", "rb").read()).hexdigest()
+        with open(W + "/payload.img", "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
     except Exception:
         return None
 
@@ -943,6 +1166,7 @@ def install():
 
     bak = {"pid": PID, "slide": slide, "island": island, "kind": ikind,
            "body": body, "size": size, "io": io, "syms": syms, "sites": {},
+           "relocs": [[syms["_SL"], 8 * len(order)]],
            "build": inst["build"], "text_sha256": inst["text_sha"],
            "profile_key": "%s|%s" % (inst["build"], inst["text_sha"]),
            "widmeta": prof["widmeta"], "widtable": prof["widtable"]}
@@ -969,7 +1193,7 @@ def install():
     json.dump(bak, open(BAK, "w"), indent=1)
     st = {"pid": PID, "slide": slide, "island": island, "body": body, "addr": body,
           "size": size, "io": io, "syms": syms, "patched": done, "t": time.time(),
-          "img_sha256": img_sha256(),
+          "img_sha256": img_sha256(), "relocs": bak["relocs"],
           "build": inst["build"], "text_sha256": inst["text_sha"],
           "widmeta": prof["widmeta"], "widtable": prof["widtable"],
           "profile_key": bak["profile_key"]}
@@ -1263,12 +1487,18 @@ if __name__ == "__main__":
             wb = None
             live = None
             js = "--json" in args
+            md = None
             for i, a in enumerate(args):
                 if a == "--wm-binary":
                     wb = args[i + 1]
                 elif a == "--no-live":
                     live = False
-            sys.exit(doctor(wb, live, js))
+                elif a == "--mode":
+                    md = args[i + 1]
+                    if md not in ("pristine", "armed", "auto"):
+                        raise SystemExit("usage: install.py doctor [--mode pristine|armed|auto]")
+                    md = None if md == "auto" else md
+            sys.exit(doctor(wb, live, js, md))
         elif cmd == "pristine":
             sys.exit(pristine())
         elif cmd == "install":
