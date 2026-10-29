@@ -20,23 +20,25 @@ also recognised without it):
                  logs/                       setup/teardown and daemon logs
                runtime state (unchanged):    /tmp/wmship   (root-owned, ephemeral)
 
-The user state directory is resolved for the *console user*, not for the effective uid: the daemon
-and `wmship.sh start` run parts of the tool through the NOPASSWD helper as root, and root must read
-and write the same two cache files the user reads.  Files created by a root run are handed back to
-the console user (`adopt()`), so a later unprivileged `doctor` can still update the cache.
+The user state directory is resolved from an explicit uid: `STURGEON_UID` when a caller sets it
+(wmship.sh exports it; asroot passes it to every python child), else the /dev/console owner when
+there is a real console login, else sudo's SUDO_UID/SUDO_USER, else the effective uid.  uid 0 is
+only chosen when every input is root or absent, so a root-owned console (headless, SSH, CI) no
+longer sends the cache to /var/root.  The daemon gets the same uid through its plist.  Files
+created by a root run are handed back to that user (`adopt()`), so a later unprivileged `doctor`
+can still update the cache.
 
 Usage:
-    wmlayout.py shell                 shell assignments for wmship.sh / setup.sh / teardown.sh
-    wmlayout.py json                  the same, as JSON
-    wmlayout.py plist <path|->        the LaunchDaemon plist, resolved for this location
-    wmlayout.py state-dir             create (on demand) and print the writable state dir
-    wmlayout.py paths                 human-readable listing
+    wmlayout.py [--uid <n>] shell   shell assignments for wmship.sh / setup.sh / teardown.sh
+    wmlayout.py [--uid <n>] json    the same, as JSON
+    wmlayout.py plist <path|->      the LaunchDaemon plist, resolved for this location
+    wmlayout.py state-dir           create (on demand) and print the writable state dir
+    wmlayout.py paths               human-readable listing
 """
 import json
 import os
 import pwd
 import shlex
-import subprocess
 import sys
 
 APP_NAME = "Sturgeon"
@@ -99,24 +101,6 @@ def app_dir():
 
 
 # ---------------------------------------------------------------- the human this install belongs to
-def console_user():
-    try:
-        u = subprocess.run(["/usr/bin/stat", "-f%Su", "/dev/console"],
-                           capture_output=True, text=True, timeout=10).stdout.strip()
-        if u and u != "root":
-            return u
-    except Exception:
-        pass
-    for env in ("SUDO_USER", "USER", "LOGNAME"):
-        u = os.environ.get(env)
-        if u and u != "root":
-            return u
-    try:
-        return pwd.getpwuid(os.getuid()).pw_name
-    except Exception:
-        return "root"
-
-
 def _pw(name):
     try:
         return pwd.getpwnam(name)
@@ -124,11 +108,74 @@ def _pw(name):
         return None
 
 
-def user_home():
-    pw = _pw(console_user())
-    if pw:
-        return pw.pw_dir
-    return os.path.expanduser("~")
+def console_uid():
+    """The uid that owns /dev/console, or None when it cannot be read.
+
+    uid 0 means "there is no console login" (a headless machine, SSH without a GUI session, CI),
+    not "the state belongs to root": that is the case this module must not mistake for a user."""
+    try:
+        return os.stat("/dev/console").st_uid
+    except OSError:
+        return None
+
+
+def _env_uid(env, key):
+    """A uid from the environment: a decimal uid, or a user name resolved through passwd."""
+    v = (env.get(key) or "").strip()
+    if not v:
+        return None
+    if v.isdigit():
+        return int(v)
+    pw = _pw(v)
+    return pw.pw_uid if pw else None
+
+
+def resolve_uid(console, env, euid):
+    """Which user's writable state this run reads and writes.  Pure over its three inputs.
+
+    Precedence: STURGEON_UID (explicit: set by wmship.sh and by asroot for its children) ->
+    the /dev/console owner when it is a real login -> SUDO_UID/SUDO_USER -> the effective uid.
+    uid 0 is chosen only when every input is root or absent; a root-owned console (headless, SSH,
+    CI) must never send a user's cache to /var/root."""
+    for candidate in (_env_uid(env, "STURGEON_UID"),
+                      console,
+                      _env_uid(env, "SUDO_UID"),
+                      _env_uid(env, "SUDO_USER"),
+                      euid):
+        if candidate is not None and candidate != 0:
+            return candidate
+    return 0
+
+
+_UID = {}
+
+
+def resolved_uid():
+    """resolve_uid() for this process; cached, because every path derivation uses it."""
+    if "uid" not in _UID:
+        _UID["uid"] = resolve_uid(console_uid(), os.environ, os.geteuid())
+    return _UID["uid"]
+
+
+def set_uid(uid):
+    """Pin the answer for this process (the --uid option, or a caller that already resolved it)."""
+    _UID["uid"] = int(uid)
+
+
+def console_user():
+    uid = resolved_uid()
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return "root" if uid == 0 else str(uid)
+
+
+def user_home(uid=None):
+    uid = resolved_uid() if uid is None else int(uid)
+    try:
+        return pwd.getpwuid(uid).pw_dir
+    except KeyError:
+        return os.path.expanduser("~")
 
 
 # ---------------------------------------------------------------- layout
@@ -139,11 +186,16 @@ def wmship_dir():
     return sub if os.path.isdir(sub) else r
 
 
-def state_dir():
+def state_dir_for(home):
+    """The writable state directory for a home directory (no environment, no passwd)."""
+    return os.path.join(home, "Library", "Application Support", APP_NAME)
+
+
+def state_dir(uid=None):
     """The writable user state directory (bundle only; the checkout writes in its own tree)."""
     if not is_bundle():
         return root()
-    return os.path.join(user_home(), "Library", "Application Support", APP_NAME)
+    return state_dir_for(user_home(uid))
 
 
 def ensure_state_dir():
@@ -257,12 +309,17 @@ def sudoers_line():
 
 def plist_text():
     """The LaunchDaemon, with this location's paths substituted.  A path baked into a shipped
-    plist is exactly the relocation bug this module exists to remove."""
+    plist is exactly the relocation bug this module exists to remove.
+
+    STURGEON_UID carries this invocation's resolved user into the daemon, so the root daemon's
+    children read the same cache the user's commands do even when /dev/console is root."""
     p = os.path.join(wmship_dir(), "com.stagemgr.wmshipd.plist")
-    text = open(p).read()
+    with open(p) as f:
+        text = f.read()
     return (text.replace("__PYTHON__", PY)
                 .replace("__WMSHIPD__", os.path.join(wmship_dir(), "wmshipd.py"))
-                .replace("__D__", D))
+                .replace("__D__", D)
+                .replace("__UID__", str(resolved_uid())))
 
 
 # ---------------------------------------------------------------- one dict for everyone
@@ -292,6 +349,7 @@ def layout():
         "plist_label": PLIST_LABEL,
         "sudoers": sudoers_path(),
         "user": console_user(),
+        "uid": resolved_uid(),
         "home": user_home(),
         "python": PY,
     }
@@ -305,11 +363,34 @@ _SHELL_VARS = (("LAYOUT", "layout"), ("ROOT", "root"), ("APP", "app"),
                ("WMX", "wmx"), ("WMHB", "wmhb"), ("WMCLS", "wmcls"),
                ("WMOBS", "wmobs"), ("R21OBS", "r21obs"),
                ("PLIST", "plist"), ("PLIST_LABEL", "plist_label"),
-               ("SUDOERS", "sudoers"), ("CONSOLE_USER", "user"), ("PY", "python"))
+               ("SUDOERS", "sudoers"), ("CONSOLE_USER", "user"),
+               ("STURGEON_UID", "uid"), ("PY", "python"))
+
+
+def _take_uid(argv):
+    """Consume a leading --uid <n> / --uid=<n>; returns (uid or None, remaining args)."""
+    if not argv:
+        return None, argv
+    a = argv[0]
+    if a == "--uid":
+        if len(argv) < 2 or not argv[1].isdigit():
+            sys.stderr.write("wmlayout: --uid needs a decimal uid\n")
+            raise SystemExit(2)
+        return int(argv[1]), argv[2:]
+    if a.startswith("--uid="):
+        v = a.split("=", 1)[1]
+        if not v.isdigit():
+            sys.stderr.write("wmlayout: --uid needs a decimal uid\n")
+            raise SystemExit(2)
+        return int(v), argv[1:]
+    return None, argv
 
 
 def main(argv):
-    cmd = argv[1] if len(argv) > 1 else "paths"
+    uid, rest = _take_uid(argv[1:])
+    if uid is not None:
+        set_uid(uid)
+    cmd = rest[0] if rest else "paths"
     L = layout()
     if cmd == "shell":
         for var, key in _SHELL_VARS:
@@ -339,7 +420,7 @@ def main(argv):
         print(sudoers_line())
         return 0
     if cmd == "plist":
-        out = argv[2] if len(argv) > 2 else "-"
+        out = rest[1] if len(rest) > 1 else "-"
         text = plist_text()
         if out == "-":
             sys.stdout.write(text)
@@ -347,7 +428,8 @@ def main(argv):
             with open(out, "w") as f:
                 f.write(text)
         return 0
-    sys.stderr.write("usage: wmlayout.py shell|json|paths|state-dir|plist <path|->\n")
+    sys.stderr.write("usage: wmlayout.py [--uid <n>] "
+                     "shell|json|paths|state-dir|sites|profile|asroot|sudoers-line|plist <path|->\n")
     return 2
 
 

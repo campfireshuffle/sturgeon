@@ -15,6 +15,14 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- The user this daemon writes state for.  wmlayout resolves it when the plist is
+             rendered (console user, else the invoking uid); without it a root daemon on a
+             headless machine would resolve the cache under /var/root. -->
+        <key>STURGEON_UID</key>
+        <string>__UID__</string>
+    </dict>
     <key>KeepAlive</key>
     <true/>
     <key>ProcessType</key>

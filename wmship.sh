@@ -36,6 +36,9 @@ if [ ! -f $R/wmlayout.py ]; then
 fi
 PY=/usr/bin/python3
 eval "$($PY $R/wmlayout.py shell)" || { echo "wmship: wmlayout failed" >&2; exit 1; }
+# wmlayout resolved one uid for this run (console login, else the invoking uid).  Export it so
+# every child that can still see environment agrees; asroot computes and passes the same value.
+export STURGEON_UID
 S=$WMSHIP
 LABEL=$PLIST_LABEL
 

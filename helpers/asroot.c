@@ -18,6 +18,7 @@
 //   level <0|3>
 //   cfg <json>             the configuration document, size- and shape-checked
 //   warm|measure|state|poses
+//   --uid                  print the state-directory uid passed to the python children (no root)
 //
 // Every path is derived from this binary's own real location (bin/asroot -> the tool tree), never
 // from argv or the environment.  There is no `sh -c`, no script file, no stdin and no inherited
@@ -58,10 +59,32 @@ static char g_layout[PATH_MAX];
 static char g_daemon[PATH_MAX];
 
 // The child environment is fixed: no PATH, HOME or shell functions from the caller survive.
+// The one fact that must survive is *which user this install belongs to*, because wmlayout derives
+// the writable cache from a uid and this child cannot see the caller's HOME or USER.
+// Same precedence as wmlayout.resolve_uid(): a real /dev/console login (never uid 0, which only
+// means "headless/SSH/CI"), else sudo's record of the caller, else this process's uid.  uid 0 is
+// used only when every one of those is root or absent.
+static uid_t resolve_uid(void) {
+    struct stat st;
+    if (stat("/dev/console", &st) == 0 && st.st_uid != 0) return st.st_uid;
+    const char *s = getenv("SUDO_UID");
+    if (s && *s) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long v = strtoul(s, &end, 10);
+        if (errno == 0 && end != s && *end == '\0' && v > 0 && v <= 0xFFFFFFFFul)
+            return (uid_t)v;
+    }
+    return getuid();
+}
+
+static char g_uid_env[32];
+
 static char *g_env[] = {
     (char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
     (char *)"HOME=/var/root",
     (char *)"LANG=en_US.UTF-8",
+    g_uid_env,
     NULL,
 };
 
@@ -515,6 +538,7 @@ static void verbs(void) {
          "  move <stage> [--cgid N]   resize <0.4..1.5> [--teach]   level <0|3>   cfg [<json>]\n"
          "  warm | measure | state | poses\n"
          "Every path is derived from this binary's location; there is no sh -c and no stdin.\n"
+         "  --uid             print the uid this helper passes to its python children\n"
          "verbs: doctor status pristine install uninstall log counters selfcheck teach probe "
          "daemon-load arm daemon-unload disarm daemon-status remove-state teardown move resize "
          "level cfg warm measure state poses");
@@ -522,6 +546,8 @@ static void verbs(void) {
 
 // ---------------------------------------------------------------- argument parsing
 int main(int argc, char **argv) {
+    snprintf(g_uid_env, sizeof g_uid_env, "STURGEON_UID=%u", (unsigned)resolve_uid());
+
     char exe[PATH_MAX];
     uint32_t size = sizeof exe;
     if (_NSGetExecutablePath(exe, &size) != 0) {
@@ -551,6 +577,14 @@ int main(int argc, char **argv) {
 
     if (strcmp(verb, "--verbs") == 0 || strcmp(verb, "help") == 0) {
         verbs();
+        return 0;
+    }
+
+    // The one non-privileged query: which uid the python children will name for the state
+    // directory.  It exposes nothing but /dev/console ownership, SUDO_UID or this uid.
+    if (strcmp(verb, "--uid") == 0) {
+        if (argc != 2) refuse("--uid takes no arguments");
+        printf("%u\n", (unsigned)resolve_uid());
         return 0;
     }
 
