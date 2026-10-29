@@ -36,7 +36,10 @@ LAST_RESIZE = D + "/last_resize.json"
 
 # One teach pass is a sweep over every tile plus the settle the payload's gate needs before it
 # will learn: the expensive half of a resize.  It happens only when the layout is not known yet.
-TEACH_SETTLE = 1.2
+# This used to be a fixed 1.2 s sleep; it is now only the *ceiling* for `wait_bases`, which returns
+# as soon as the payload's settled flags are set.  Two wake cycles (~1.6 s) are the most a normal
+# strip needs, including a single-tile strip that has no other tile to nudge.
+TEACH_SETTLE = 2.5
 FAST_TRIES = 2           # bases present and fresh: apply, then re-sweep only if a tile missed
 SLOW_TRIES = 4           # the old budget, kept for the path that just re-learned the layout
 SELFCHECK_TOL = 0.02     # issue #5: a tile more than 2% off the expected scale is a refusal
@@ -223,31 +226,57 @@ def teach_reason(tiles, nat, rows):
     return None
 
 
-def wait_bases(ids, timeout=TEACH_SETTLE, sweep=None, poll=0.1, resweep=0.6):
+def wake_call(tile=None, M=None):
+    """One keeper call, on a tile we are *not* waiting for (issue #4 follow-up).
+
+    A base is promoted on the first keeper call after its settle window has passed, and the payload
+    has no timer: it runs only when the WindowManager writes a pose.  The last tile of a sweep
+    therefore has a candidate and no later call, so the tool that waits for the flag has to supply
+    that call.  Hovering a tile whose base *already exists* is harmless -- its own base is settled,
+    so re-hovering it cannot lose anything -- and the keeper promotes every pending candidate on
+    the way in, before it records the new write.
+    """
+    M = M or wmctl()
+    rows = rail_tiles()
+    if tile is None and rows:
+        have = {int(r["wid"]) for r in poses() if r.get("base")}
+        tile = next((t for t in rows if int(t["id"]) in have), None) or rows[0]
+    if tile is None:
+        return False
+    x, y = int(tile["x"] + 6), int(tile["y"] + tile["h"] / 2)
+    M.sh("%s 3 500 %d %d 12" % (M.MOVE, x, y))
+    time.sleep(0.12)
+    M.sh("%s %d %d 3 500 12" % (M.MOVE, x, y))
+    time.sleep(0.12)
+    return True
+
+
+def wait_bases(ids, timeout=TEACH_SETTLE, sweep=None, poll=0.1, gap=0.35):
     """Bounded wait for the keeper's *settled* flags (issue #4), instead of a fixed sleep.
 
-    The payload promotes a base when SETTLE_TICKS state documents have arrived with no newer write
-    for that window; that is observable here as `poses()` reporting `base: 1` for the tile.  The
-    payload has no timer -- it runs only when WindowManager calls a patched function -- and the
-    last tile of a sweep has no later write to promote it, so while any tile is still missing this
-    gives the payload a call with one measurement pass.  `timeout` (the old fixed window) is now
-    only a ceiling; the normal case returns as soon as the flags are set.
+    The payload promotes a base when `SETTLE_TICKS` state documents have arrived with no newer
+    write for that window; that is observable here as `poses()` reporting `base: 1`.  The payload
+    has no timer -- it runs only when WindowManager calls a patched function -- and a candidate
+    needs one more keeper call *after* its settle window to be promoted.  So while any tile is
+    still missing this supplies that call with `wake_call`, which hovers a tile that already has a
+    base, and gives the documents `gap` seconds to pass first.
 
-    Returns (missing ids, sweeps issued).
+    `timeout` (the old fixed sleep) is now only a ceiling; the happy path returns immediately.
+
+    Returns (missing ids, calls supplied).
     """
-    sweep = sweep or (lambda: wmctl().force_writes(passes=1))
-    t0 = time.time()
-    last = t0
-    sweeps = 0
+    sweep = sweep or (lambda: wake_call())
+    t_end = time.time() + timeout
+    wakes = 0
     while True:
         have = {int(r["wid"]) for r in poses() if r.get("base")}
         missing = [int(i) for i in ids if int(i) not in have]
-        if not missing or time.time() - t0 >= timeout:
-            return missing, sweeps
-        if time.time() - last >= resweep:
-            sweep()
-            sweeps += 1
-            last = time.time()
+        if not missing or time.time() >= t_end:
+            return missing, wakes
+        time.sleep(gap)          # let SETTLE_TICKS documents pass since that tile's last write
+        if not sweep():
+            return missing, wakes
+        wakes += 1
         time.sleep(poll)
 
 
@@ -308,14 +337,18 @@ def apply_scale(s, tries=None, teach=False):
     nat = natural()
     why = "requested" if teach else teach_reason(tiles, nat, poses())
     taught = None
+    no_base = []
     if why:
         taught = teach_now(M)
-        if not taught["ok"]:
+        no_base = [int(x) for x in (taught.get("no_base") or [])]
+        if not taught["ok"] and not taught.get("tiles"):
             cfg_set(teach=True)
             return {"s": s, "ok": False, "tiles": [], "teach": taught,
-                    "err": "teach pass did not produce a base for %d tile(s): %s"
-                           % (len(taught["no_base"]),
-                              ", ".join(str(x) for x in taught["no_base"]) or "no rail tiles")}
+                    "err": "teach pass found no strip tiles to measure"}
+        # A tile with no resting base cannot be scaled -- the keeper must not scale a pose that is
+        # not a settled rest -- but it must not take the other tiles down with it (issue #4
+        # follow-up: one untameable tile used to refuse the whole resize).  Carry on with the
+        # tiles that do have a base, name the ones that do not, and never claim ok.
         nat = natural()
     if tries is None:
         tries = SLOW_TRIES if why else FAST_TRIES
@@ -329,6 +362,7 @@ def apply_scale(s, tries=None, teach=False):
     # pin it with `cfg '{"pivot_fixed":true,"qx":…,"qy":…}'`.
     c = cfg_set(s=s, dilate=abs(s - 1.0) > 1e-9, teach=False)
     rep = {"s": s, "gen": c["gen"], "tries": 0, "tiles": [], "ok": False,
+           "no_base": no_base, "partial": bool(no_base),
            "teach": {"needed": bool(why), "reason": why, "passes": 1 if why else 0,
                      "secs": (taught or {}).get("secs", 0.0)}}
     for i in range(tries):
@@ -345,6 +379,28 @@ def apply_scale(s, tries=None, teach=False):
         rep["ok"] = bool(got) and all(abs(t["ratio"] - s) <= 0.06 for t in got)
         if rep["ok"]:
             break
+    # A tile with no base is left at 1.0 by the keeper (it must not scale an unsettled pose), so
+    # name it instead of letting the per-tile ratios alone imply it.  `ok` stays false for a scale
+    # whenever any tile was skipped; a restore (s == 1.0) is satisfied by a tile that was never
+    # moved, but the list is still reported.
+    #
+    # The list is recomputed here, not copied from the teach: the measurement sweeps are keeper
+    # calls too, so a candidate the teach left pending is usually promoted by the first one, and
+    # the report must say what is true at the end rather than what was true after the teach.
+    rep["scaled"] = [t["id"] for t in rep["tiles"]
+                     if t["ratio"] is not None and abs(t["ratio"] - s) <= 0.06]
+    rep["not_scaled"] = [t["id"] for t in rep["tiles"]
+                         if t["ratio"] is not None and abs(t["ratio"] - s) > 0.06]
+    have = {int(r["wid"]) for r in poses() if r.get("base")}
+    rep["no_base"] = sorted({int(i) for i in no_base if int(i) not in have}
+                            | {int(t["id"]) for t in rep["tiles"] if int(t["id"]) not in have})
+    rep["partial"] = bool(rep["no_base"])
+    if rep["no_base"]:
+        rep["err"] = ("%d tile(s) have no resting base and were not scaled (%s); %d tile(s) %s"
+                      % (len(rep["no_base"]), ", ".join(str(x) for x in rep["no_base"]),
+                         len(rep["scaled"]), "scaled" if rep["scaled"] else "scaled nothing"))
+        if abs(s - 1.0) > 1e-9:
+            rep["ok"] = False
     # Issue #3: width alone cannot see a pivot error.  At 1.0 the tile must also be back at the
     # x/y the teach pass recorded; an error here is the quiet "tiles drift" failure made loud.
     rep["xy"] = {"checked": False, "ok": None, "moved": []}

@@ -509,7 +509,7 @@ class SettleWait(unittest.TestCase):
     """#4: the teach path waits for the payload's settled flag, bounded, never a fixed sleep."""
 
     def test_returns_as_soon_as_every_tile_has_a_base(self):
-        seq = [[], [{"wid": 1, "base": 1}], [{"wid": 1, "base": 1}]]
+        seq = [[{"wid": 1, "base": 1}], [{"wid": 1, "base": 1}]]
         n = {"i": 0}
         sweeps = []
 
@@ -520,16 +520,17 @@ class SettleWait(unittest.TestCase):
 
         with mock.patch.object(C, "poses", side_effect=poses), \
                 mock.patch.object(C.time, "sleep", return_value=None):
-            missing, issued = C.wait_bases([1], timeout=5.0, sweep=lambda: sweeps.append(1))
+            missing, issued = C.wait_bases([1], timeout=5.0,
+                                           sweep=lambda: sweeps.append(1) or True)
         self.assertEqual(missing, [])
         self.assertEqual(issued, 0)
-        self.assertEqual(sweeps, [])          # no sweep needed once the flag appears
+        self.assertEqual(sweeps, [])          # no call needed once the flag appears
 
     def test_is_bounded_when_no_base_ever_settles(self):
         with mock.patch.object(C, "poses", return_value=[]), \
                 mock.patch.object(C.time, "sleep", return_value=None):
             t0 = time.time()
-            missing, _ = C.wait_bases([7], timeout=0.05, sweep=lambda: None, resweep=0.0)
+            missing, _ = C.wait_bases([7], timeout=0.05, sweep=lambda: True, gap=0.0)
         self.assertEqual(missing, [7])
         self.assertLess(time.time() - t0, 2.0)
 
@@ -539,8 +540,36 @@ class SettleWait(unittest.TestCase):
         sweeps = []
         with mock.patch.object(C, "poses", return_value=[]), \
                 mock.patch.object(C.time, "sleep", return_value=None):
-            C.wait_bases([7], timeout=0.05, sweep=lambda: sweeps.append(1), resweep=0.0)
+            C.wait_bases([7], timeout=0.05, sweep=lambda: sweeps.append(1) or True, gap=0.0)
         self.assertGreaterEqual(len(sweeps), 1)
+
+    def test_a_pending_candidate_is_promoted_by_one_call_on_a_taught_tile(self):
+        """The regression: the last tile of a sweep has a candidate and no later keeper call.
+
+        A call on a tile whose base already exists is enough -- the keeper runs `promote_bases()`
+        at the top of the call, before it records the new write -- and it cannot disturb the tile
+        we are waiting for because it is a different window.
+        """
+        state = {"calls": 0}
+
+        def poses():
+            # the first call promotes tile 7; until then only tile 1 has a base
+            row = [{"wid": 1, "base": 1}]
+            if state["calls"]:
+                row.append({"wid": 7, "base": 1})
+            else:
+                row.append({"wid": 7, "base": 0})
+            return row
+
+        def wake():
+            state["calls"] += 1
+            return True
+
+        with mock.patch.object(C, "poses", side_effect=poses), \
+                mock.patch.object(C.time, "sleep", return_value=None):
+            missing, issued = C.wait_bases([7], timeout=5.0, sweep=wake, gap=0.0)
+        self.assertEqual(missing, [])
+        self.assertEqual(issued, 1)          # exactly one call, not a sweep per poll
 
 
 class ResizeAssertsGeometry(unittest.TestCase):
@@ -590,6 +619,65 @@ class ResizeAssertsGeometry(unittest.TestCase):
     def test_geometry_is_not_checked_while_a_scale_is_applied(self):
         rep = self.run_scale(1.5, self.frames)
         self.assertFalse(rep["xy"]["checked"])
+
+
+class ResizeDegradesWhenOneTileCannotTeach(unittest.TestCase):
+    """#4 follow-up: one tile that never settles must not refuse the whole resize.
+
+    The keeper is right not to scale a tile with no resting base -- that would scale an unsettled
+    pose.  What was wrong was the CLI: it refused before applying anything, so one untameable tile
+    cost every other tile.  The command now scales what it can, names what it cannot, and is never
+    `ok` for a scale it did not fully achieve.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.wm = mock.Mock()
+        self.tiles = [{"id": 1, "owner": "A", "x": 16, "y": 100, "w": 140, "h": 120},
+                      {"id": 2, "owner": "B", "x": 16, "y": 240, "w": 140, "h": 120}]
+        self.nat = {"1": 140, "2": 140}
+        self.s = 1.0
+        self.bases = {1}                      # tile 2 never settles
+
+    def wall(self):
+        return [{"id": t["id"], "owner": t["owner"], "x": t["x"], "y": t["y"], "h": t["h"],
+                 "w": int(round(t["w"] * (self.s if t["id"] in self.bases else 1.0)))}
+                for t in self.tiles]
+
+    def run_scale(self, s, teach_result):
+        self.s = s
+        with mock.patch.object(C, "wmctl", return_value=self.wm), \
+                mock.patch.object(C, "rail_tiles", side_effect=self.wall), \
+                mock.patch.object(C, "natural", return_value=dict(self.nat)), \
+                mock.patch.object(C, "poses",
+                                  side_effect=lambda: [{"wid": w, "base": 1}
+                                                       for w in sorted(self.bases)]), \
+                mock.patch.object(C, "teach_now", mock.Mock(return_value=teach_result)), \
+                mock.patch.object(C, "cfg_set", mock.Mock(return_value={"gen": 1})), \
+                mock.patch.object(C, "hb", return_value={}), \
+                mock.patch.object(C, "natural_frames", return_value={}), \
+                mock.patch.object(C.time, "sleep", return_value=None), \
+                mock.patch.object(C, "LAST_RESIZE", os.path.join(self.tmp.name, "r.json")):
+            return C.apply_scale(s)
+
+    def test_scales_the_tiles_it_can_and_names_the_one_it_cannot(self):
+        rep = self.run_scale(1.5, {"ok": False, "moves": 12, "tiles": 2, "bases": 1,
+                                   "no_base": [2], "waits": 1, "secs": 1.0})
+        self.assertFalse(rep["ok"])                 # loud: not a successful resize
+        self.assertTrue(rep["partial"])
+        self.assertEqual(rep["no_base"], [2])
+        self.assertEqual(rep["scaled"], [1])
+        self.assertEqual(rep["not_scaled"], [2])
+        self.assertIn("2", rep["err"])
+        self.assertEqual([t["id"] for t in rep["tiles"]], [1, 2])   # not an empty refusal
+
+    def test_a_restore_still_succeeds_for_what_it_touched(self):
+        rep = self.run_scale(1.0, {"ok": False, "moves": 12, "tiles": 2, "bases": 1,
+                                   "no_base": [2], "waits": 1, "secs": 1.0})
+        self.assertTrue(rep["ok"])                  # every tile is at 1.0; the skipped one never moved
+        self.assertTrue(rep["partial"])
+        self.assertEqual(rep["no_base"], [2])
 
 
 if __name__ == "__main__":

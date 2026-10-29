@@ -2070,8 +2070,15 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     // no-op by construction (promote_one returns when the candidate already is the base), and at
     // any other scale the `feq(s, 1.0)` term already excludes it.
     int legal = feq(s, 1.0) && !is_identity(m) && out && hold_ok && !retract;
-    if (p->cand_ok && p->cand_ticks >= SETTLE_TICKS && now() - p->t_cand <= CAND_TTL && G.teach)
+    // A candidate that never reached the settle window is "rejected as unsettled" whether the
+    // write that supersedes it was legal or not.  The counter used to be incremented only in the
+    // illegal branch, so a tile that re-emits a legal pose every few milliseconds -- the case that
+    // matters -- reported zero, which is exactly the wrong instrument reading.
+    int superseded = p->cand_ok && p->cand_ticks < SETTLE_TICKS;
+    if (p->cand_ok && p->cand_ticks >= SETTLE_TICKS && now() - p->t_cand <= CAND_TTL && G.teach) {
         promote_one(p, now(), out);      // this write proves the candidate ended its burst
+        superseded = 0;
+    }
     if (!G.teach) {
         // the tool is sweeping or measuring: record nothing, and do not throw away a candidate it
         // taught earlier -- the scale change that follows promotes it.
@@ -2081,12 +2088,9 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
         p->cand_ticks = 0;
         p->cand_ok = 1;
     } else {
-        // this write supersedes anything pending for this window; if it arrived before the
-        // candidate could settle, that candidate is exactly the "rejected as unsettled" count
-        // issue #4 asks to expose.
-        if (p->cand_ok && p->cand_ticks < SETTLE_TICKS) G.n_unsettled++;
-        p->cand_ok = 0;
+        p->cand_ok = 0;                  // this write supersedes anything pending for this window
     }
+    if (superseded) G.n_unsettled++;
     if (G.trace) trace_one(wid, m, p, out, ours, legal, retract, rail, s, hold_ok);
     G.last_mx = m[12];
     if (force) {
