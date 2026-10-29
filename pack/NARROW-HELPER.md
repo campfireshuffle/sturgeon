@@ -81,7 +81,15 @@ Properties that make this narrower than the shell:
 - **`teardown` disarms before it deletes anything** (issue #21): restore the sites, verify
   byte-exact, boot the daemon out, stop the helpers, verify again, then remove the plist and rule.
   A pid change (WindowManager restarted) is a clean "nothing to restore"; an unverifiable restore
-  prints `PATCH: UNVERIFIED` and the removal still proceeds, with a non-zero exit.
+  prints `PATCH: UNVERIFIED` and the removal still proceeds, with a non-zero exit.  If
+  WindowManager is not running at all there is nothing live to check, so that is reported as
+  "nothing live to restore" and is not a failure — a machine with a dead WindowManager must still
+  be uninstallable.
+- **The elevation ladder has exactly two rungs.** `teardown.sh` runs the verb directly as root, or
+  through `sudo -n` on this rule; there is no `osascript` administrator prompt, because a GUI
+  dialog in a non-interactive `brew uninstall` can block forever (issue #44).  With neither rung it
+  exits 3, changes nothing, and prints `sudo <app>/…/teardown.sh`.  When nothing privileged exists
+  (no plist, no rule, nothing armed) `teardown.sh` exits 0 without root at all.
 
 ### One environment consequence: `HOME=/var/root`
 
