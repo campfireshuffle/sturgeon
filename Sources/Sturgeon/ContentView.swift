@@ -1,3 +1,4 @@
+import SturgeonKit
 import SwiftUI
 
 struct ContentView: View {
@@ -6,31 +7,38 @@ struct ContentView: View {
     private var pct: String { "\(Int((model.scale * 100).rounded()))%" }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            header
-            statusGrid
-            if let refusal = model.doctorRefusal, model.doctorOK == false {
-                Text(refusal)
-                    .font(.system(size: 10))
-                    .foregroundColor(.orange)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(refusal)
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 10) {
+                header
+                statusGrid
+                if let refusal = model.doctorRefusal, model.doctorOK == false {
+                    Text(refusal)
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(refusal)
+                }
+                Divider()
+                controls
+                Divider()
+                actions
+                Divider()
+                gestureSection
+                Divider()
+                diagnosticsSection
+                if model.setupNeeded {
+                    setupBanner
+                }
+                if model.axNeeded {
+                    axBanner
+                }
+                footer
             }
-            Divider()
-            controls
-            Divider()
-            actions
-            if model.setupNeeded {
-                setupBanner
-            }
-            if model.axNeeded {
-                axBanner
-            }
-            footer
+            .padding(13)
+            .frame(width: 402, alignment: .leading)
         }
-        .padding(13)
-        .frame(width: 392)
+        .frame(width: 420, height: 720)
     }
 
     // MARK: - header
@@ -209,6 +217,197 @@ struct ContentView: View {
             }
         }
     }
+
+    // MARK: - gesture
+
+    private var gestureSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Toggle(isOn: Binding(get: { model.gestureEnabled },
+                                 set: { model.gestureEnabled = $0 })) {
+                Text("Resize the strip with \(model.gestureModifier.label) + scroll")
+                    .font(.system(size: 12))
+            }
+            .toggleStyle(.checkbox)
+            .accessibilityIdentifier("gestureToggle")
+
+            HStack(spacing: 6) {
+                Text("Chord")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .frame(width: 52, alignment: .leading)
+                Picker("Chord", selection: Binding(get: { model.gestureModifier },
+                                                   set: { model.gestureModifier = $0 })) {
+                    ForEach(GestureModifier.presets, id: \.self) { preset in
+                        Text(preset.label).tag(preset)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 170)
+                .accessibilityIdentifier("gestureChord")
+                Spacer()
+                Text(pct)
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(model.armed ? .primary : .secondary)
+                    .frame(width: 42, alignment: .trailing)
+                    .accessibilityIdentifier("gestureReadout")
+            }
+
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Circle()
+                    .fill(model.inputStatus.hasPrefix("listening") ? Color.green : Color.secondary)
+                    .frame(width: 7, height: 7)
+                Text(model.inputStatus)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("gestureStatus")
+            }
+
+            HStack(spacing: 8) {
+                Button("Permissions…") { model.requestInputPermissions() }
+                    .buttonStyle(.link)
+                    .font(.system(size: 10))
+                    .accessibilityIdentifier("gesturePermissions")
+                Button("Input Monitoring") { model.openInputMonitoringSettings() }
+                    .buttonStyle(.link)
+                    .font(.system(size: 10))
+                Button("Accessibility") { model.openAccessibilitySettings() }
+                    .buttonStyle(.link)
+                    .font(.system(size: 10))
+            }
+
+            Text("Only acts while the pointer is inside the strip's gutter; every other scroll passes "
+                 + "through. Releasing the chord restores the other app's scrolling. "
+                 + "Drag a window onto a tile to move it into that stage.")
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - diagnostics
+
+    private var diagnosticsSection: some View {
+        DisclosureGroup(isExpanded: Binding(get: { model.diagnosticsOpen },
+                                            set: { open in
+                                                model.diagnosticsOpen = open
+                                                if open { model.refreshDiagnostics() }
+                                            })) {
+            VStack(alignment: .leading, spacing: 7) {
+                counterGrid
+                if let resize = model.lastResize {
+                    resizeTable(resize)
+                } else {
+                    Text("No resize measured in this session.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+
+                Toggle(isOn: Binding(get: { model.trace }, set: { model.setTrace($0) })) {
+                    Text("Pose trace").font(.system(size: 11, weight: .semibold))
+                }
+                .toggleStyle(.checkbox)
+                .disabled(!model.armed || model.busy)
+                .accessibilityIdentifier("traceToggle")
+                Text("Advanced. Publishes every keeper decision (m0, base, retract/departure/lift) "
+                     + "into the payload log. Leave it off for normal use: the log ring is small, and "
+                     + "a resize sweep moves your pointer across every tile for a minute or two — "
+                     + "do not run one while sharing your screen.")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ScrollView(.vertical) {
+                    Text(model.diagnosticsText())
+                        .font(.system(size: 9, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(6)
+                }
+                .frame(height: 168)
+                .background(RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.secondary.opacity(0.08)))
+                .accessibilityIdentifier("diagnosticsBlock")
+
+                HStack {
+                    Button("Copy diagnostics") { model.copyDiagnostics() }
+                        .disabled(model.busy)
+                        .accessibilityIdentifier("diagnosticsCopy")
+                    Spacer()
+                    Button("Refresh") { model.refreshDiagnostics() }
+                        .buttonStyle(.link)
+                        .font(.system(size: 10))
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Text("Diagnostics")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                if model.diagnosticsOpen {
+                    Text(model.armed ? "live" : "disarmed")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .accessibilityIdentifier("diagnosticsGroup")
+    }
+
+    private var counterGrid: some View {
+        let snapshot = model.diagnosticsSnapshot()
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("Counters")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.secondary)
+            HStack(spacing: 10) {
+                ForEach(DiagnosticsSnapshot.counterKeys, id: \.self) { key in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(key)
+                            .font(.system(size: 8))
+                            .foregroundColor(.secondary)
+                        Text(snapshot.counter(key).map(String.init) ?? "—")
+                            .font(.system(size: 11, design: .monospaced))
+                    }
+                    .frame(width: 50, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private func resizeTable(_ resize: ResizeReport) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Last resize  s=\(resize.scale.map { String(format: "%.2f", $0) } ?? "?")  "
+                 + "ok=\(resize.ok ? "true" : "false")  tiles=\(resize.tiles.count)")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(resize.ok ? .secondary : .orange)
+            HStack(spacing: 0) {
+                Text("tile").frame(width: 42, alignment: .leading)
+                Text("natural").frame(width: 62, alignment: .trailing)
+                Text("measured").frame(width: 70, alignment: .trailing)
+                Text("ratio").frame(width: 54, alignment: .trailing)
+            }
+            .font(.system(size: 8))
+            .foregroundColor(.secondary)
+            ForEach(Array(resize.tiles.enumerated()), id: \.offset) { _, tile in
+                HStack(spacing: 0) {
+                    Text(tile.id.map(String.init) ?? "—")
+                        .frame(width: 42, alignment: .leading)
+                    Text(tile.natural.map { String(format: "%.0f", $0) } ?? "—")
+                        .frame(width: 62, alignment: .trailing)
+                    Text(tile.width.map { String(format: "%.0f", $0) } ?? "—")
+                        .frame(width: 70, alignment: .trailing)
+                    Text(tile.ratio.map { String(format: "%.3f", $0) } ?? "—")
+                        .frame(width: 54, alignment: .trailing)
+                }
+                .font(.system(size: 10, design: .monospaced))
+            }
+        }
+    }
+
+    // MARK: - banners
 
     private var setupBanner: some View {
         HStack(alignment: .top, spacing: 8) {

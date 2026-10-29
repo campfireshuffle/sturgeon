@@ -26,10 +26,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // for the automated proof, where the terminal that drives AX would otherwise take focus.
         popover.behavior = CommandLine.arguments.contains("--pin") ? .applicationDefined : .transient
         popover.animates = false
-        popover.contentSize = NSSize(width: 392, height: 520)
+        popover.contentSize = NSSize(width: 420, height: 720)
         popover.contentViewController = NSHostingController(rootView: ContentView(model: model))
 
         model.refresh(doctor: true, stages: true)
+        if CommandLine.arguments.contains("--diagnostics") {
+            model.diagnosticsOpen = true
+            model.refreshDiagnostics()
+        }
 
         if CommandLine.arguments.contains("--show") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.show() }
