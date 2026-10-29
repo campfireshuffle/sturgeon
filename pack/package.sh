@@ -24,6 +24,9 @@
 #
 # With no Developer ID available the build falls back to an ad-hoc signature (SIGN_IDENTITY=-) and
 # says so: runnable locally, NOT distributable, NOT notarisable.
+#
+# Releases are cut by the Release workflow, which keeps its credentials as repository secrets. That
+# is the supported path; a local run needs nothing on this machine.
 set -eu
 SELF=${0:A}
 PACK=${SELF:h}
