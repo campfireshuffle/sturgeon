@@ -1,17 +1,5 @@
 import Foundation
 
-/// The pose trace is the payload's own per-decision log (`m0`, the base value, and the
-/// retract/departure/lift verdicts).  `wmship/payload.c` on this build parses no trace key at all
-/// (issue #31), so the control is present but gated off: the UI must not promise output that
-/// cannot appear.
-public enum PoseTrace {
-    public static let isAvailable = false
-    public static let issue = 31
-    public static let unavailableNote = "Not available in this payload build (see #31)."
-
-    public static func canEnable(armed: Bool) -> Bool { isAvailable && armed }
-}
-
 /// One paste-ready diagnostics block.  Everything the panel shows is assembled here from already
 /// decoded reports, so the formatting is testable without a WindowManager, a payload or a popover.
 ///
@@ -38,6 +26,14 @@ public struct DiagnosticsSnapshot: Equatable {
     public var gesture: String
     public var ambiguousDrops: Int
     public var inputRearms: Int
+    /// Whether the `trace` config key is on.  The block reports the switch state, never records
+    /// the trace did not produce.
+    public var traceOn: Bool
+    /// How many records the ring held on the last read, or `nil` when trace is off or was never
+    /// read.  The table renders the tail of these; the total is the honest number for a report.
+    public var traceRecordCount: Int?
+    /// Why the last read produced no table (a refusal, or an older payload with no ring).
+    public var traceNote: String?
     /// The app's own armed flag, used when the status document could not be decoded at all.
     public var armedFlag: Bool?
 
@@ -54,6 +50,9 @@ public struct DiagnosticsSnapshot: Equatable {
                 gesture: String = "off",
                 ambiguousDrops: Int = 0,
                 inputRearms: Int = 0,
+                traceOn: Bool = false,
+                traceRecordCount: Int? = nil,
+                traceNote: String? = nil,
                 armed: Bool? = nil) {
         self.generated = generated
         self.appVersion = appVersion
@@ -68,6 +67,9 @@ public struct DiagnosticsSnapshot: Equatable {
         self.gesture = gesture
         self.ambiguousDrops = ambiguousDrops
         self.inputRearms = inputRearms
+        self.traceOn = traceOn
+        self.traceRecordCount = traceRecordCount
+        self.traceNote = traceNote
         self.armedFlag = armed
     }
 
@@ -165,7 +167,19 @@ public struct DiagnosticsSnapshot: Equatable {
         lines.append("ambiguous-drops \(ambiguousDrops)")
         lines.append("input-rearms \(inputRearms)")
         lines.append("gesture \(gesture)")
-        lines.append("trace \(PoseTrace.isAvailable ? "available" : "unavailable (not in this payload build; #\(PoseTrace.issue))")")
+        // While the key is off, say only that: an availability claim about a feature nobody
+        // turned on is exactly the false affordance #25 removed.
+        if traceOn {
+            lines.append("trace on (advanced)")
+            if let traceRecordCount {
+                lines.append("trace-records \(traceRecordCount)")
+            }
+        } else {
+            lines.append("trace off")
+        }
+        if traceOn, let traceNote, !traceNote.isEmpty {
+            lines.append("trace-note \(traceNote)")
+        }
 
         return Self.redact(lines.joined(separator: "\n"))
     }

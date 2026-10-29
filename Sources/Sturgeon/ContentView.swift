@@ -359,20 +359,7 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
 
-                Toggle(isOn: .constant(false)) {
-                    Text("Pose trace").font(.system(size: 11, weight: .semibold))
-                }
-                .toggleStyle(.checkbox)
-                .disabled(true)
-                .accessibilityIdentifier("traceToggle")
-                Text(PoseTrace.unavailableNote + " The payload half is issue #31: until it lands, "
-                     + "this control is deliberately inert rather than writing a key nothing reads. "
-                     + "Advanced when it does land: it publishes every keeper decision (m0, base, "
-                     + "retract/departure/lift), and a resize sweep moves your pointer across every "
-                     + "tile for a minute or two — do not run one while sharing your screen.")
-                    .font(.system(size: 9))
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                traceSection
 
                 ScrollView(.vertical) {
                     Text(model.diagnosticsText())
@@ -410,6 +397,76 @@ struct ContentView: View {
             }
         }
         .accessibilityIdentifier("diagnosticsGroup")
+    }
+
+    /// The pose trace (issue #31).  The toggle writes the key the payload parses; the table only
+    /// exists after a successful read.  While the key is off the section says so and offers no
+    /// table, and a refusal is shown verbatim instead of an empty list that could read as "the
+    /// keeper made no decisions".
+    private var traceSection: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Toggle(isOn: Binding(get: { model.trace }, set: { model.setTrace($0) })) {
+                Text("Pose trace").font(.system(size: 11, weight: .semibold))
+            }
+            .toggleStyle(.checkbox)
+            .disabled(!model.armed || model.busy)
+            .accessibilityIdentifier("traceToggle")
+
+            if model.trace {
+                Text("On. The keeper records one line per decision into a 16 KB ring; nothing "
+                     + "reads it back, so it cannot change a decision. Show trace reads the last "
+                     + "\(PoseTrace.maxRows) records.")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    Button(model.traceShowing ? "Reading…" : "Show trace") { model.showTrace() }
+                        .disabled(!model.armed || model.busy || model.traceShowing)
+                        .accessibilityIdentifier("traceShow")
+                    Spacer()
+                }
+
+                if let read = model.traceRead {
+                    if case .records(let rows, let total) = read {
+                        Text("Last \(rows.count) of \(total) record(s)")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                        ScrollView([.vertical, .horizontal]) {
+                            Text(rows.map(\.raw).joined(separator: "\n"))
+                                .font(.system(size: 9, design: .monospaced))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(6)
+                        }
+                        .frame(height: 150)
+                        .background(RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.secondary.opacity(0.08)))
+                        .accessibilityIdentifier("traceRecords")
+
+                        Text(PoseTrace.legend)
+                            .font(.system(size: 8))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if let note = read.note {
+                        Text((read.isFailure ? "Trace read failed — " : "Trace unavailable — ")
+                             + note)
+                            .font(.system(size: 9))
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("traceNote")
+                    }
+                }
+            } else {
+                Text("Off. Nothing is recorded while this is off. Turning it on writes the `trace` "
+                     + "key the payload parses (issue #31); a resize sweep moves your pointer "
+                     + "across every tile for a minute or two — do not run one while sharing "
+                     + "your screen.")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private var counterGrid: some View {

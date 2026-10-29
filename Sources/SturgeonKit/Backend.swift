@@ -125,7 +125,7 @@ public enum Backend {
         case .status, .counters, .configWrite: return "install.py missing"
         case .stages: return "stagepilot missing"
         case .rootProbe: return "asroot missing"
-        case .doctor, .configRead, .start, .stop, .resize, .move, .moveWindow, .selfcheck:
+        case .doctor, .configRead, .start, .stop, .resize, .move, .moveWindow, .selfcheck, .trace:
             return "wmship.sh missing"
         }
     }

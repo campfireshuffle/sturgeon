@@ -124,7 +124,7 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(lines.contains("ambiguous-drops 2"))
         XCTAssertTrue(lines.contains("input-rearms 1"))
         XCTAssertTrue(lines.contains("gesture listening (Control + Option)"))
-        XCTAssertTrue(lines.contains("trace unavailable (not in this payload build; #31)"))
+        XCTAssertTrue(lines.contains("trace off"))
         XCTAssertTrue(lines.contains(where: { $0.hasPrefix("doctor FAIL") }))
 
         // The doctor's refusal named a home directory; the block must not carry it.
@@ -193,19 +193,34 @@ final class DiagnosticsTests: XCTestCase {
 
     // MARK: - config
 
-    // MARK: - the pose trace (gated, not promised)
+    // MARK: - the pose trace
 
-    func testPoseTraceIsGatedOffInThisBuild() {
-        XCTAssertFalse(PoseTrace.isAvailable, "payload.c has no trace parsing on this build")
-        XCTAssertFalse(PoseTrace.canEnable(armed: true),
-                       "an armed app still cannot produce trace output")
+    func testPoseTraceGateIsGoneButTheBlockOnlyClaimsWhatIsOn() {
+        // #31 landed: an armed app can enable the key, a disarmed one cannot.
+        XCTAssertTrue(PoseTrace.canEnable(armed: true))
         XCTAssertFalse(PoseTrace.canEnable(armed: false))
-        XCTAssertTrue(PoseTrace.unavailableNote.contains("#31"))
+        XCTAssertTrue(PoseTrace.legend.contains("b0"))
+        XCTAssertTrue(PoseTrace.legend.contains("rail_now"))
 
-        // The block must not claim the trace is on or off: it says the feature is unavailable.
-        let block = DiagnosticsSnapshot().block()
-        XCTAssertTrue(block.contains("trace unavailable (not in this payload build; #31)"))
-        XCTAssertFalse(block.contains("trace on"))
+        // Off: the block says only that. It must not claim records that do not exist.
+        let off = DiagnosticsSnapshot(traceOn: false, traceRecordCount: 12).block()
+        XCTAssertTrue(off.contains("trace off"))
+        XCTAssertFalse(off.contains("trace on"))
+        XCTAssertFalse(off.contains("trace-records"))
+
+        // On with a successful read: the switch state and the row count are facts.
+        let on = DiagnosticsSnapshot(traceOn: true, traceRecordCount: 12).block()
+        XCTAssertTrue(on.contains("trace on (advanced)"))
+        XCTAssertTrue(on.contains("trace-records 12"))
+    }
+
+    func testTraceUnavailableIsSurfacedInTheBlockInsteadOfAnEmptyTable() {
+        let block = DiagnosticsSnapshot(
+            traceOn: true,
+            traceNote: "trace read failed — asroot: refused: unknown verb trace").block()
+        XCTAssertTrue(block.contains("trace on (advanced)"))
+        XCTAssertTrue(block.contains("trace-note trace read failed — asroot: refused: unknown verb trace"))
+        XCTAssertFalse(block.contains("trace-records"))
     }
 
     func testPreflightVerdictAndReasonAreInTheBlock() throws {

@@ -88,6 +88,24 @@ final class CommandTests: XCTestCase {
                        "/usr/bin/python3 \(installPy) cfg \(Paths.quote(payload))")
     }
 
+    func testTraceWritesTheKeyThePayloadParses() throws {
+        let payload = try json(.trace(true))
+        XCTAssertEqual(payload,
+                       #"{"births":false,"dilate":false,"gen":1,"level_manual":0,"levels":false,"qx":16,"qy":490,"replay":false,"s":1,"trace":true}"#)
+        let readBack = try XCTUnwrap(PayloadConfig(json: payload))
+        XCTAssertTrue(readBack.trace)
+        XCTAssertFalse(PayloadConfig().trace, "trace defaults off, matching payload.c")
+    }
+
+    func testTraceRunsTheScriptsTraceVerb() throws {
+        // wmship.sh forwards `trace` to the helper's own verb (`sudo -n asroot trace`), which
+        // reads the ring through the task port.  The app must call the surface, not ctl.py.
+        let call = try invocation(.trace)
+        XCTAssertEqual(call.executable.path, root.appendingPathComponent("wmship.sh").path)
+        XCTAssertEqual(call.arguments, ["trace"])
+        XCTAssertEqual(call.timeout, 40)
+    }
+
     func testRootProbeIsTheSingleBareTrue() throws {
         let call = try invocation(.rootProbe)
         XCTAssertEqual(call.executable.path, "/usr/bin/sudo")
