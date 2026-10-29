@@ -72,9 +72,16 @@ say() {
 }
 
 # ---------------------------------------------------------------- what is already true
+# "Already set up" means the rule FILE exists and the probe works.  Neither half alone is enough:
+# `sudo -n` also succeeds on a cached timestamp, and a root run bypasses sudo entirely — both made
+# setup.sh say "already set up" for a rule that had just been deleted, and the next privileged
+# command then failed.
 RULE_OK=0
-if [ "$(id -u)" = 0 ]; then RULE_OK=1
-elif sudo -n "$ASROOT" probe >/dev/null 2>&1; then RULE_OK=1; fi
+if [ -e "$SUDOERS" ]; then
+  if [ "$(id -u)" = 0 ] || sudo -n "$ASROOT" probe >/dev/null 2>&1; then
+    RULE_OK=1
+  fi
+fi
 
 T=$(mktemp -d /tmp/stagepilot-setup.XXXXXX) || die "no scratch directory"
 trap '/bin/rm -rf '"$T" EXIT INT TERM

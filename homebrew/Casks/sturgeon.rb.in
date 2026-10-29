@@ -17,6 +17,44 @@ cask "sturgeon" do
 
   app "Sturgeon.app"
 
+  # The privileged undo is one bundled script, deliberately: it must run as root, BEFORE the app is
+  # deleted, and it uses the tool's own NOPASSWD helper so `brew uninstall` needs no password.
+  # It disarms the live patch before it removes the helper that can restore it (issue #21), and
+  # with no root and no working rule it exits 3 immediately with the exact `sudo` command instead
+  # of raising an administrator dialog that blocks a non-interactive uninstall (#44).
+  #
+  # The executable is /bin/zsh, not teardown.sh, on purpose.  Homebrew raises
+  # "uninstall script … does not exist" for a missing executable *before* `must_succeed:` is
+  # consulted, so pointing at the bundle made the cask impossible to remove once the app had been
+  # dragged to the Trash — only `--force` cleared it (#44).  /bin/zsh always exists; the bundle's
+  # script is an argument.  Present: it runs unchanged, and its non-zero exit still aborts the
+  # uninstall (must_succeed) so a failed restore cannot delete the only copy of the tool.
+  # Absent: the guard prints the exact privileged cleanup and exits 0, so the cask record and the
+  # zap stanza still run.
+  teardown = "#{appdir}/Sturgeon.app/Contents/Resources/wmship/teardown.sh"
+  teardown_guard = <<~SH
+    if [ -x "$1" ]; then exec "$1"; fi
+    print -r -- "sturgeon: $1 is gone — the app bundle was removed before the cask."
+    print -r -- "sturgeon: the cask record is removed now; if Setup was ever run, finish as root:"
+    print -r -- "  sudo /bin/launchctl bootout system/com.stagemgr.wmshipd 2>/dev/null"
+    print -r -- "  sudo /bin/rm -f /Library/LaunchDaemons/com.stagemgr.wmshipd.plist /etc/sudoers.d/stage-pilot"
+    print -r -- "  sudo /bin/rm -rf /tmp/wmship"
+  SH
+  uninstall script: {
+    executable:   "/bin/zsh",
+    args:         ["-c", teardown_guard, "sturgeon-uninstall", teardown],
+    must_succeed: true,
+    print_stdout: true,
+    print_stderr: true,
+  }
+
+  # Zap removes the user state.  /tmp/wmship is ALSO gone after `brew uninstall --zap` -- the
+  # uninstall script above runs first (uninstall stanzas always run for --zap) and removes it as
+  # root through the bundled NOPASSWD helper.  It is deliberately not repeated as a zap `delete:`,
+  # because Homebrew deletes paths outside the home directory with sudo and would prompt for a
+  # password even though the path is already gone.
+  zap trash: "~/Library/Application Support/Sturgeon"
+
   # First run is a GUI flow on purpose: the app's Set Up button runs the bundled setup.sh through
   # `osascript … with administrator privileges`, so the one privileged step needs no terminal.
   caveats <<~EOS
@@ -40,22 +78,7 @@ cask "sturgeon" do
     `brew uninstall --cask sturgeon` restores the WindowManager patch first, then boots the
     LaunchDaemon out and removes the sudoers rule; `brew uninstall --zap --cask sturgeon` also
     removes ~/Library/Application Support/Sturgeon and /tmp/wmship.  Quit the menu-bar app first
-    (it is an LSUIElement app).
+    (it is an LSUIElement app).  If the app bundle is already gone, the uninstall still completes
+    and prints the privileged cleanup commands.
   EOS
-
-  # The privileged undo is one bundled script, deliberately: it must run as root, BEFORE the app is
-  # deleted, and it uses the tool's own NOPASSWD helper so `brew uninstall` needs no password.
-  # It disarms the live patch before it removes the helper that can restore it (issue #21).
-  uninstall script: {
-              executable:   "#{appdir}/Sturgeon.app/Contents/Resources/wmship/teardown.sh",
-              must_succeed: false,
-              print_stdout: true,
-            }
-
-  # Zap removes the user state.  /tmp/wmship is ALSO gone after `brew uninstall --zap` -- the
-  # uninstall script above runs first (uninstall stanzas always run for --zap) and removes it as
-  # root through the bundled NOPASSWD helper.  It is deliberately not repeated as a zap `delete:`,
-  # because Homebrew deletes paths outside the home directory with sudo and would prompt for a
-  # password even though the path is already gone.
-  zap trash: "~/Library/Application Support/Sturgeon"
 end

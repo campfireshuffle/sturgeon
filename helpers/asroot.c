@@ -344,11 +344,37 @@ static void pkill_name(const char *name) {
     run_fixed("/usr/bin/pkill", argv);
 }
 
+// Is there a live WindowManager to restore?  A clean "nothing to verify" is not a failed restore:
+// after a crash or a logout the six sites went away with the process, and refusing to uninstall
+// in that state would leave the app with no way out.
+static int wm_running(void) {
+    char *argv[] = {(char *)"/usr/bin/pkill", (char *)"-0", (char *)"-x", (char *)"WindowManager", NULL};
+    return run_fixed("/usr/bin/pkill", argv) == 0;
+}
+
+// `launchctl bootout` returns before the job has actually exited, and wmshipd writes daemon.json
+// into /tmp/wmship on its way out: removing the directory first lets the dying daemon recreate it
+// (observed: an uninstall "removed /tmp/wmship" and left daemon.json behind).  Wait for the
+// process, then remove.  The pattern is a constant, not input.
+static int daemon_process_running(void) {
+    char *argv[] = {(char *)"/usr/bin/pgrep", (char *)"-f", (char *)"wmshipd.py", NULL};
+    return run_fixed("/usr/bin/pgrep", argv) == 0;
+}
+
+static void wait_for_daemon_exit(void) {
+    for (int i = 0; i < 30 && daemon_process_running(); i++) usleep(100000);
+    if (!daemon_process_running()) return;
+    char *kill[] = {(char *)"/usr/bin/pkill", (char *)"-f", (char *)"wmshipd.py", NULL};
+    run_fixed("/usr/bin/pkill", kill);
+    for (int i = 0; i < 20 && daemon_process_running(); i++) usleep(100000);
+}
+
 // teardown [--keep-state]: the cask's privileged undo.  Fixed order: restore and verify while the
 // helper that can restore still exists, then stop the daemon, then remove the plist and the rule.
 // Every target is a constant or derived from this binary's own tree; nothing comes from argv.
 static int verb_teardown(int keep_state) {
     int rc = 0;
+    int live = wm_running();
     if (path_exists("/tmp/wmship/state.json")) {
         printf("patch: restoring the six sites before removal\n");
         char *a1[] = {(char *)"uninstall", NULL};
@@ -357,6 +383,8 @@ static int verb_teardown(int keep_state) {
         int r2 = (r1 == 0) ? run_python_wait(g_install, a2) : 1;
         if (r1 == 0 && r2 == 0) {
             printf("patch: disarmed — every site verified byte-exact\n");
+        } else if (!live) {
+            printf("patch: WindowManager is not running; its sites went with the process\n");
         } else {
             printf("PATCH: WARNING the restore could not be verified (install.py rc %d/%d)\n", r1, r2);
             printf("PATCH: UNVERIFIED — the six sites may still be patched\n");
@@ -374,6 +402,8 @@ static int verb_teardown(int keep_state) {
     } else {
         printf("daemon: %s was not loaded\n", target);
     }
+    wait_for_daemon_exit();
+    printf("daemon: no wmshipd.py process remains\n");
 
     pkill_name("wmhb");
     pkill_name("wmobs");
@@ -384,9 +414,13 @@ static int verb_teardown(int keep_state) {
     // restore above and the bootout.  This is the last moment the tree can still verify itself.
     char *a3[] = {(char *)"pristine", NULL};
     if (run_python_wait(g_install, a3) != 0) {
-        printf("PATCH: WARNING a site was re-patched between the restore and the daemon stop\n");
-        printf("PATCH: UNVERIFIED — the six sites may still be patched\n");
-        rc = 1;
+        if (!live) {
+            printf("patch: WindowManager is not running; nothing live can still be patched\n");
+        } else {
+            printf("PATCH: WARNING a site was re-patched between the restore and the daemon stop\n");
+            printf("PATCH: UNVERIFIED — the six sites may still be patched\n");
+            rc = 1;
+        }
     } else {
         printf("patch: verified pristine again after the daemon stop\n");
     }
