@@ -15,11 +15,13 @@ Working notes for this repository. Read this before changing code.
 | `pack/` | release signing, notarization, stapling and the casks |
 | `tools/` | proof helper `axui` and the icon generator |
 | `wmship.sh` | the user-facing tool entry point (`start`, `stop`, `status`, `doctor`, `resize`, …) |
-| `wmship/` | installer, capability CLI, payload source, daemon, build scripts |
+| `wmship/` | installer, capability CLI, payload source, daemon, build scripts; `selftest.py` proves the memory guards |
+| `helpers/asroot.c` | the privileged entry point: a fixed verb dispatcher, not a shell |
 | `wmlocate.py` | resolves the patch sites from binary content |
 | `wm/`, `a/` | helper sources (window probing, stage listing) |
 | `homebrew/` | the cask, staged into `campfireshuffle/homebrew-tap` |
 | `docs/TECHNICAL.md` | design, constraints and the per-build runbook |
+| `docs/GEOMETRY.md`, `docs/RESEARCH-*.md` | the studies behind the geometry and the unmeasured assumptions |
 
 ## Build
 
@@ -38,10 +40,20 @@ swift test                       # the package tests (no root, no WindowManager)
 ./wmship.sh doctor               # resolve and validate every patch site; must pass
 ./wmship.sh start                # arm
 ./wmship.sh status               # build, ARMED, capabilities, debugger: none
+./wmship.sh selfcheck            # resize preflight: probes at 1.2, then restores
 ./wmship.sh resize 0.6           # numeric per-tile check
 ./wmship.sh resize 1.0
 ./wmship.sh stop                 # restore byte-exact and verify
+./wmship.sh pristine             # PRISTINE: yes
+./scripts/selftest.sh            # bundle invariants; no root, no WindowManager
+python3 wmship/selftest.py       # memory guards; no root, no task port
 ```
+
+`doctor` has two modes with disjoint assertions: `pristine` (every site holds the on-disk image's
+bytes) and `armed` (`state.json` describes this WindowManager and every site holds the recorded
+stub). Auto follows `state.json`'s pid. An explicit mode the state cannot support is a refusal,
+never a silent downgrade. The daemon only re-applies to a new WindowManager, so its gate is
+pristine.
 
 Leave the machine disarmed and free of debuggers when you finish. One armer at a time: two
 concurrent installs invalidate each other.
@@ -69,17 +81,25 @@ concurrent installs invalidate each other.
 - A base is the pose an animation *settles* on, not a frame from the middle of it. Hovering a tile
   animates its scale entry away from rest and back; teaching mid-burst bakes that magnification into
   every later scale, and it looks like a scaling bug rather than a teaching bug.
-- Gate teaching on: strip drawn in the gutter right now (`rail_now`, `strip_x >= 0`), no flush
-  window, scale 1.0, and not our own write. Refuse retract and departure poses geometrically.
+- Gate base teaching on: strip drawn in the gutter right now (`rail_now` present, `rail_x >= 0`), no
+  flush window (`front_x > 60`), scale 1.0, and outside a strip-transition hold. Refuse retract and
+  departure poses geometrically. Do **not** gate base teaching on the write being our own: a
+  replayed rest is byte-identical to our own last write, and excluding it makes a teach sweep learn
+  nothing after on-top has run. `rp` is gated on `!ours`, because our scaled matrix must not become
+  a replay.
 - Poses are stored as raw bytes: cast to `double` before comparing the scale entry, or you compare a
   single mantissa byte. Translation and scale change independently, so "the pose moved" is not
   evidence of a relayout.
 - The scale pivot is a constant (`16, 490`) today; if the strip geometry changes on a new build,
-  re-derive it (docs/TECHNICAL.md, Fragility).
+  re-derive it (docs/TECHNICAL.md, Fragility; docs/RESEARCH-multi-display.md).
 - **Two poses per tile, and they are not interchangeable.** `base` is the resting pose and the only
   thing that may be scaled; `rp` is the replay transform used by strip-on-top and is taught from
   anything that settles while the strip is drawn. Tightening one must not blind the other: on-top
   has to work for a tile with no taught base at all.
+- Both poses are **promoted after 0.22 s with no newer write for that window**, never captured per
+  write. `base` is also the largest `m0` the tile shows (a hover lift is the smaller value), and it
+  is dropped when the strip leaves. `rp` survives a hide and refuses a candidate written before the
+  last reveal. The margins are measured: longest in-animation gap 0.13 s, post-rest silence ≥0.3 s.
 - Never write a page that is not already writable, and never leave a page a branch points into
   without execute permission. Both are `KERN_PROTECTION_FAILURE` inside `WindowManager`, and the
   installer refuses rather than trying (`wmship/selftest.py` proves the guard without root).
@@ -88,6 +108,15 @@ concurrent installs invalidate each other.
 
 **Privilege and distribution**
 
+- The only root path is `bin/asroot`, a **fixed verb dispatcher, not a shell**. It accepts the verbs
+  published by `asroot --verbs`, validates each argument by shape (scale 0.4–1.5, decimal window id,
+  JSON object under 8 KiB, printable stage), and derives every path from its own location plus
+  `/tmp/wmship`. No `-c`, no stdin, no inherited environment. The three legacy `-c` shapes the app
+  still sends are matched exactly and are the only exception.
+- A new privileged action is a **new verb** in `helpers/asroot.c`, in the dispatch table and in
+  `--verbs` — never a wider argument to an existing one. `./scripts/selftest.sh` fails on a `-c`
+  passthrough or a direct `install.py`/`ctl.py` call in the shipped shell scripts, so route callers
+  through verbs.
 - Root, SIP off and `task_for_pid` are the floor. No debugger entitlement is required; do not add
   `com.apple.security.cs.debugger`.
 - Sign every embedded Mach-O before signing the app, with hardened runtime and a timestamp.
@@ -100,6 +129,15 @@ concurrent installs invalidate each other.
 
 - No synthetic clicks or drags, and do not rearrange the user's stages or windows. The one accepted
   pointer input is `wmship.sh resize`, which sweeps the tiles because that is the shipped path.
+- Before offering or claiming resize works, run `wmship.sh selfcheck`. It applies a 1.2 probe with
+  teaching off, requires every tile within 2%, then restores the caller's scale; the strip visibly
+  scales for a few seconds. It is a CLI preflight today — the app's slider is still enabled on
+  `armed` alone, so do not describe the UI as gated by it.
+- The app's diagnostics panel, gesture resize and drop-to-tile paths are unit-tested at their pure
+  seams only; none has been exercised against an armed WindowManager. Label them implemented but
+  unverified.
+- The payload parses no `trace` key (#31). Do not document `cfg trace=true` as working; use
+  `wmship.sh poses` and `wmship.sh counters` for evidence.
 - Verify with numbers (window layers, per-tile geometry), not with screenshots of intent.
 
 ## Keeping up with macOS
