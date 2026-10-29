@@ -1,0 +1,78 @@
+name: CI
+
+# Every push and every pull request: build the package, build the auxiliaries, assemble and sign
+# an ad-hoc bundle, then assert the properties of that bundle that do not need root or a live
+# WindowManager (scripts/selftest.sh).  Release signing lives in release.yml; this workflow never
+# touches a certificate, never notarizes and never arms anything.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Show the toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          swift --version
+          uname -m
+          test "$(uname -m)" = arm64
+
+      - name: Build the Swift package
+        shell: bash
+        run: swift build -c release
+
+      - name: Test the Swift package
+        shell: bash
+        run: swift test
+
+      - name: Build the helpers, the stage lister and the payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/build-helpers.sh
+          ( cd wmship && ./build.sh )
+
+      - name: Package an ad-hoc bundle (no credentials)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIGN_IDENTITY=- ./scripts/package.sh 0.0.0 1
+
+      - name: Self-test the release bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/selftest.sh art/Sturgeon.app
+
+      - name: Self-test the dev bundle too
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/selftest.sh dist/Sturgeon.app
+
+      - name: Upload the bundle on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sturgeon-selftest-failure
+          path: |
+            art/Sturgeon.app
+            /tmp/sturgeon-selftest-*
+          if-no-files-found: ignore
+          retention-days: 3
