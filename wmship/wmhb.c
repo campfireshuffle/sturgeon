@@ -713,6 +713,15 @@ int main(int argc, char **argv) {
                     if (publish_pd_cut(t0 - 0.10)) break;
                 }
             }
+            // Round 37: the 0.10 s set above is only the *probe* that lets the observer publish a
+            // window created just before this call; it must not be what the payload reads.  The
+            // payload decides freshness itself (BIRTH_MAX_AGE, 2.5 s), so publish the same
+            // PD_WINDOW set the periodic path publishes.  Two measured consequences of sending
+            // the narrow set instead: a candidate the payload was still allowed to act on was
+            // dropped, and when the probe found nothing the *previous*, older publication stayed
+            // in the page -- a multi-document launch then injected a restored document while the
+            // requested one (83 ms newer, already in obs.log) was invisible to the payload.
+            publish_pd();
             publish_rg();
             publish_wids(t);
             publish_widcg();

@@ -1001,6 +1001,18 @@ static int fresh_candidate(void) {
 //   2  a serial has no live object in the census yet.
 // Both 1 and 2 mean the published buffers are from before this window existed, which is what a
 // rendezvous (one helper pass with the WM parked) fixes.
+// Which of two published CGWindowIDs is the newer window?  The observer's timestamp first; when
+// two windows first appear in the same 20 ms poll the stamps are identical, and then the larger
+// CGWindowID is the later one, because the window server allocates them from a counter that only
+// grows (measured on a multi-document launch: r40-c/r40-b/r40-seven restored at 7737.862 got
+// 9792/9791/9790, and the document the launch asked for, 83 ms later, got 9793).  Ordering by
+// this rule is what lets a launch that restores documents and then opens the requested one be
+// identified as the requested window instead of a restored one.
+static int pd_newer(double ts, u32 cg, double best_ts, u32 best_cg) {
+    if (ts != best_ts) return ts > best_ts;
+    return cg > best_cg;
+}
+
 static u64 pick_widcg(u32 *out_cg, u32 *newest_cg, int *need) {
     *out_cg = 0; *newest_cg = 0; *need = 0;
     u32 tgt_cg = 0; u64 tgt_ser = 0; double tgt_ts = -1.0;
@@ -1021,7 +1033,7 @@ static u64 pick_widcg(u32 *out_cg, u32 *newest_cg, int *need) {
         // all by itself; BIRTH_MAX_AGE is ~7x the measured create->inject latency and still well
         // inside the WM's placement tail.
         if (now() - ts > BIRTH_MAX_AGE) continue;
-        if (ts > young_ts) { young_ts = ts; young = cg; }
+        if (pd_newer(ts, cg, young_ts, young)) { young_ts = ts; young = cg; }
         // the WM's map: serial for this CGWindowID
         u64 ser = 0;
         if (io_widcg_len) {
@@ -1037,7 +1049,7 @@ static u64 pick_widcg(u32 *out_cg, u32 *newest_cg, int *need) {
             }
         }
         if (!ser) continue;
-        if (ts > tgt_ts) { tgt_ts = ts; tgt_cg = cg; tgt_ser = ser; }
+        if (pd_newer(ts, cg, tgt_ts, tgt_cg)) { tgt_ts = ts; tgt_cg = cg; tgt_ser = ser; }
     }
     *newest_cg = young;
     if (!tgt_cg) { *need = 1; return 0; }          // the window is not in the WM's table yet
