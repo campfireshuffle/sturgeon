@@ -84,11 +84,13 @@ WORK=0
 [ -e "$D/state.json" ] && WORK=1
 if [ "$WORK" = 0 ]; then
   if [ -e "$D" ]; then
-    # /tmp/wmship is root-owned once the daemon has run, but a user-owned leftover can go now.
-    if rm -rf "$D" 2>/dev/null && [ ! -e "$D" ]; then
+    # Only remove a runtime directory this user owns.  Once the daemon has run, /tmp/wmship is
+    # root-owned (and 0777, so a plain `rm -rf` would happily unlink root's files): say what to run
+    # instead of guessing.
+    if [ -O "$D" ] && rm -rf "$D" 2>/dev/null && [ ! -e "$D" ]; then
       say "removed the runtime directory $D"
     else
-      say "$D is still there (root-owned); remove it with:"
+      say "$D is root-owned, so it is left in place; remove it with:"
       print -r -- "  sudo /bin/rm -rf $D"
     fi
   fi
