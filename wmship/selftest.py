@@ -21,6 +21,7 @@ WindowManager, nothing written outside a temporary directory.
 """
 import json
 import os
+import re
 import shutil
 import signal
 import struct
@@ -274,12 +275,63 @@ def test_daemon(tmp):
     check("the daemon's own doctor call cannot clear it", "--json" in src)
 
 
+# ---------------------------------------------------------------- 4. payload invariants (no root)
+def test_payload_invariants():
+    """The three properties of round 3 that a source check can hold, with no WindowManager.
+
+    They are invariants, not style: a decision that reads the trace ring would make the diagnostic
+    part of the control plane; a scale about the config pivot would make the shipped pivot the old
+    constant again; a wall-clock promotion window would bring back the timing assumption (#4).
+    The app bundle ships the payload *image* but not its sources, so in the bundle this falls back
+    to checking the symbols the image must expose."""
+    psrc = os.path.join(HERE, "payload.c")
+    if not os.path.exists(psrc):
+        syms = json.load(open(os.path.join(HERE, "payload.syms.json")))["syms"]
+        check("the shipped payload image exposes the trace ring (issue #31)",
+              all(k in syms for k in ("_io_tr", "_io_tr_len", "_io_tr_pos", "_io_tr_seq")))
+        return
+    src = open(psrc).read()
+    branches = [l for l in src.splitlines()
+                if re.search(r"\b(if|while|for)\s*\([^)]*io_tr", l)]
+    check("the trace ring is write-only (no branch reads io_tr, issue #31)",
+          not branches, "; ".join(branches)[:200])
+    check("the trace is parsed from the cfg and defaults off",
+          'jbool(cfg, "trace"' in src and "trace_one(" in src)
+    check("every keeper trace record is gated on the flag", "if (G.trace) trace_one(" in src)
+
+    scales = [l.strip() for l in src.splitlines()
+              if re.search(r"mat_scale\(.*,\s*s\s*,", l) and not l.strip().startswith(("//", "*", "/*"))]
+    check("scaling uses the resolved pivot (issue #3)",
+          bool(scales) and all("G.px, G.py" in l for l in scales), "; ".join(scales)[:300])
+    check("the config pivot is only reachable through `pivot_fixed`",
+          src.count("G.qx") <= 2 and "G.pivot_fixed && G.has_qx" in src)
+    check("a scale with no derivable pivot is refused, not guessed",
+          "G.n_piv_miss++" in src and "if (!G.piv_src)" in src)
+
+    check("promotion is the settle detector, not a wall-clock window (issue #4)",
+          "SETTLE_TICKS" in src and "#define QUIET" not in src
+          and "p->cand_ticks >= SETTLE_TICKS" in src)
+    check("the rail id-set invalidates bases structurally",
+          "G.n_railchg++" in src and "G.rail_key_geom" in src)
+
+    ins = open(os.path.join(HERE, "install.py")).read()
+    check("the shipped config no longer carries the constant pivot",
+          '"qx"' not in ins.split("CFG_DEFAULT")[1].split("}")[0])
+    ctl = open(os.path.join(HERE, "ctl.py")).read()
+    check("ctl.py writes no pivot", "qx=16" not in ctl and "490" not in ctl)
+    ars = os.path.join(HERE, "..", "helpers", "asroot.c")
+    check("the trace verb exists in every layer",
+          "def trace_dump" in ctl
+          and (not os.path.exists(ars) or '"trace"' in open(ars).read()))
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="wmship-selftest-")
     try:
         test_signature()
         test_guard(tmp)
         test_daemon(tmp)
+        test_payload_invariants()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print()

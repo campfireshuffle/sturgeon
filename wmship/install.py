@@ -80,9 +80,9 @@ MOV_X1_X30 = 0xAA1E03E1          # mov x1, x30
 MOV_X30_X1 = 0xAA0103FE          # mov x30, x1
 DIRECT_REACH = 0x7FFFFFC         # |b| relocation range, bytes
 CFG_DEFAULT = {"births": True, "replay": True, "dilate": False, "levels": True,
-               "level_manual": 0, "s": 1.0, "qx": 16.0, "qy": 490.0, "gen": 1,
+               "level_manual": 0, "s": 1.0, "gen": 1,
                "use_desc": False, "widcg": True, "retain": True, "probe": False,
-               "dump_model": False}
+               "dump_model": False, "trace": False}
 
 SY = None
 PID = 0
@@ -1440,7 +1440,7 @@ def hbtext():
     """The heartbeat JSON, sliced by the payload's own length field: the page is not zero-filled
     behind the text, so splitting on NUL appends the tail of the previous, longer write."""
     n = struct.unpack("<I", rd_sym("_io_hb_len", 4))[0]
-    n = max(0, min(n, 1024))
+    n = max(0, min(n, 1536))
     return rd_sym("_io_hb", max(1, n))[:n].decode(errors="replace")
 
 

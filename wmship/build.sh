@@ -10,7 +10,12 @@
 set -eu
 cd "$(dirname "$0")"
 SDK=$(xcrun --show-sdk-path)
-clang -O2 -arch arm64 -ffreestanding -fno-builtin -fno-stack-protector \
+# NO_RAILCHG=1 builds the *negative control* for the stale-base trial: the layout-invalidation
+# block (issues #4) is compiled out, so a tile set that shrinks in place keeps its stale bases.
+# The shipped image never defines it; the trial builds both and diffs the per-tile ratios.
+DEFS=""
+[ "${NO_RAILCHG:-0}" = "1" ] && DEFS="-DWM_NO_RAILCHG"
+clang -O2 -arch arm64 -ffreestanding -fno-builtin -fno-stack-protector $DEFS \
       -fno-asynchronous-unwind-tables -fno-unwind-tables -Wno-int-conversion \
       -c payload.c -o payload.o
 clang -arch arm64 -c island.s -o island.o

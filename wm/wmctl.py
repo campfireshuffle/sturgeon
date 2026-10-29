@@ -365,11 +365,20 @@ def force_writes(passes=2):
                 and 0 <= w["x"] < 320 and 8 <= w["w"] <= 330 and 8 <= w["h"] <= 560]
         for a in apps:
             # enter at the tile's exposed left edge: the current stage's window covers most of
-            # the rail and only the first ~30 px of the gutter receive the pointer.
-            sh("%s 700 500 %d %d 24" % (MOVE, int(a["x"] + 6), int(a["y"] + a["h"] / 2)))
+            # the rail and only the first ~30 px of the gutter receive the pointer.  The start
+            # point is inside the gutter, not in the middle of the screen (it used to be 700,500):
+            # every event stream begins by teleporting to (x1,y1), so starting mid-screen made the
+            # strip retract and re-reveal between tiles, which sets a 0.30 s teach hold on every
+            # visit and turns "did this tile settle" into a timing race (round 3, issue #4).
+            sh("%s 3 500 %d %d 24" % (MOVE, int(a["x"] + 6), int(a["y"] + a["h"] / 2)))
             time.sleep(0.3)
             n += 1
-        sh("%s 30 400 700 500 20" % MOVE)
+        # Park the pointer in the gutter margin, not in the middle of the screen: the strip
+        # retracts within ~0.4 s of the pointer leaving the left edge, and every caller measures
+        # right after a sweep (0.35 s).  x = 3 is left of the first tile, so it keeps the strip
+        # drawn without hovering any tile.  Leaving it at 700,500 made the measurement a race and
+        # dropped every base on the way out (issue #4 trial, round 3).
+        sh("%s 30 400 3 500 20" % MOVE)
         time.sleep(0.4)
     return n
 

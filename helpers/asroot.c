@@ -522,7 +522,7 @@ static int verb_known(const char *v) {
         "doctor", "status", "pristine", "install", "uninstall", "log", "counters",
         "probe", "daemon-load", "arm", "daemon-unload", "disarm", "daemon-status",
         "remove-state", "teardown", "move", "resize", "teach", "selfcheck",
-        "level", "cfg", "warm", "measure", "state", "poses", NULL,
+        "level", "cfg", "warm", "measure", "state", "poses", "trace", NULL,
     };
     for (int i = 0; known[i]; i++)
         if (strcmp(v, known[i]) == 0) return 1;
@@ -536,12 +536,12 @@ static void verbs(void) {
          "  probe   daemon-load|arm   daemon-unload|disarm   daemon-status   remove-state\n"
          "  teardown [--keep-state]\n"
          "  move <stage> [--cgid N]   resize <0.4..1.5> [--teach]   level <0|3>   cfg [<json>]\n"
-         "  warm | measure | state | poses\n"
+         "  warm | measure | state | poses | trace [--reset]\n"
          "Every path is derived from this binary's location; there is no sh -c and no stdin.\n"
          "  --uid             print the uid this helper passes to its python children\n"
          "verbs: doctor status pristine install uninstall log counters selfcheck teach probe "
          "daemon-load arm daemon-unload disarm daemon-status remove-state teardown move resize "
-         "level cfg warm measure state poses");
+         "level cfg warm measure state poses trace");
 }
 
 // ---------------------------------------------------------------- argument parsing
@@ -759,6 +759,16 @@ int main(int argc, char **argv) {
         if (nargs != 0) refuse("%s takes no arguments", verb);
         char *args[] = {(char *)verb, NULL};
         run_ctl(args);
+    }
+    if (strcmp(verb, "trace") == 0) {
+        // trace [--reset] -- the keeper's diagnostic ring; a read plus an optional zeroing write
+        int reset = 0;
+        if (nargs == 1 && strcmp(a1, "--reset") == 0) reset = 1;
+        else if (nargs != 0) refuse("trace accepts only --reset");
+        char *args[] = {(char *)"trace", (char *)"--reset", NULL};
+        if (reset) run_ctl(args);
+        char *plain[] = {(char *)"trace", NULL};
+        run_ctl(plain);
     }
 
     refuse("unknown verb '%s'", verb);
