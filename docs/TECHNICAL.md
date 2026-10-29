@@ -69,17 +69,38 @@ each tile's resting transform, so tiles scale about their own geometry. The keep
 current scale onto every pose the WindowManager emits, which catches tiles that are re-laid out after
 a stage change.
 
+Scaling needs a baseline, and the WindowManager never offers one: it emits a transform only when
+something changes. So `resize` begins with a **teach pass** — a pointer sweep across every tile with
+scaling disabled, which makes the WindowManager emit each tile's animation in and back out again. The
+value the return animation settles on is that tile's resting pose, and it is stored as the base for
+all later scaling. A single tile costs about a second: roughly 250 ms of animation in, a dwell, about
+300 ms back out, and a settle. Seven tiles, two passes, one teach pass and a verification pass is why
+one `resize` invocation takes a minute or two, and why the pointer moves while it runs. It is waiting
+for animations to finish, not computing.
+
 ### The strip keeper
 
-The hard part is knowing what to scale. A tile's pose arrives as a 4x4 matrix. The WindowManager
-writes a *resting* pose, a *lifted* pose while the pointer is over a tile, and a *retract* pose when
-the strip hides. The resting pose is the only correct base; the lifted pose is about 5.5% larger and
-is restored by the WindowManager from its own copy without calling the hook, so a lifted base would
-persist and scale every later transform by 1.055.
+The hard part is knowing what to scale. A tile's pose arrives as a 4x4 matrix whose first entry
+carries the linear scale. The WindowManager draws three kinds of pose: the *resting* pose, an
+*animated* pose while the pointer is over a tile (the tile is drawn a few percent larger, so the
+scale entry moves away from the resting value frame by frame), and a *retract* pose when the strip
+hides, which is a translation only.
 
-The keeper therefore treats the **smallest pose seen outside a retract** as the base, gates teaching
-on a complete, fresh state document (`flush`, `rail_now`, strip on screen, scale 1.0, not our own
-write), and discards bases when the strip leaves the screen.
+Only the resting pose is a valid base. A base taken from the middle of the hover animation bakes
+that magnification into every later scale — the error is a few percent and looks like a scaling bug
+rather than a teaching bug.
+
+The keeper therefore waits for the end of an animation burst and keeps the value the pose settles
+on, and it gates teaching on four conditions: a complete and fresh state document (`flush` and
+`rail_now` present), the strip actually on screen, scale at 1.0, and the write not being its own.
+Retract and departure poses are refused geometrically so a hide can never be mistaken for a rest.
+When the strip leaves the screen its bases are discarded.
+
+Two invariants matter when touching this code. Poses are stored as raw bytes, so comparisons must
+cast to `double` before reading the scale entry; comparing the byte array directly compares one
+mantissa byte and silently produces plausible-looking decisions. And a pose's translation and its
+scale change independently: a hide moves the tile without changing its scale, so "the pose moved" is
+not evidence of a relayout.
 
 ## State channel
 
@@ -108,11 +129,43 @@ manageable:
 If any of this cannot be established with confidence, the tool refuses to install and says which
 check failed.
 
+## Fragility
+
+Every capability is inferred from observed behaviour, so each one rests on an assumption that a
+future macOS can invalidate. What matters is whether a break is loud or quiet.
+
+| dependency | if it changes | failure mode |
+|---|---|---|
+| Six patch sites, located by content and cross-reference | locator cannot identify a site | **loud**: named refusal, nothing is written |
+| Per-build object layout (`WindowID` class and ivar offsets) | unknown build | **loud**: doctor refuses before arming |
+| Root, SIP off, `task_for_pid` | SIP enabled | **loud**: the tool will not arm |
+| SkyLight transform and level calls | private API changes | **quiet**: strip-on-top and resize stop applying |
+| Tiles emit transforms on pointer movement | emission changes | **quiet**: sweeps produce nothing, resize does nothing |
+| Hover animation shape (burst length, settle value) | timing or easing changes | **quiet**: bases are wrong by a few percent |
+| The scale pivot (`16, 490` — a point in the strip gutter) | display size or strip position changes | **quiet**: tiles scale about the wrong point |
+| Fixed settle windows (300–500 ms) | slower or faster animations | **quiet**: teaching reads a mid-animation pose |
+
+The quiet ones are the reason the resize path verifies every tile against a freshly measured natural
+size and reports per-tile ratios instead of a single boolean. They are also the reason the keeper
+keeps a trace: with `cfg trace=true` the payload publishes each decision (`m0`, base value, and the
+retract/departure/lift verdicts), so a wrong ratio can be diagnosed without a debugger.
+
+Known weak points, in the order they are worth hardening:
+
+1. **The scale pivot is a constant.** It should be derived from the strip's own geometry each time,
+   so a different display or a moved strip cannot scale about the wrong point.
+2. **Settle windows are time-based.** Replacing them with "the value has stopped changing" would
+   remove the timing assumption entirely.
+3. **No preflight for resize.** A single-tile sweep that measures one ratio and reports it would turn
+   a quiet mis-measure into a refusal before the UI offers the control.
+
 ## Performance
 
 - Window creation to injection: 58–72 ms, no debugger attached.
 - Per-tile transform replay: the WindowManager's own transaction API, no polling loop in the target.
 - The payload contains no timers; it acts only when the patched code runs.
+- A resize teach-and-measure pass is dominated by animation time, not work: roughly one second per
+  tile, so a full `resize` is a minute or two.
 
 ## Approaches evaluated
 
@@ -132,7 +185,12 @@ check failed.
    it to `profile.json` under the new build key.
 3. If a site no longer matches, update `wmlocate.py`'s structural signature. Prove it against a
    shifted copy of the binary, and against corrupted copies that must refuse.
-4. Rebuild the payload, then verify: births, move, strip on top, resize. Numbers, not impressions.
+4. Re-derive the scale pivot if the strip's geometry changed (see Fragility) rather than trusting the
+   constant.
+5. Confirm the pose stream still behaves as the keeper assumes: with `cfg trace=true`, a hover should
+   produce a burst that returns to a settled value, and a hide should translate without changing the
+   scale entry. If either is untrue, the teach pass needs revisiting before resize can be trusted.
+6. Rebuild the payload, then verify: births, move, strip on top, resize. Numbers, not impressions.
 
 ## Verification
 

@@ -66,10 +66,16 @@ concurrent installs invalidate each other.
 
 **The strip keeper**
 
-- A resting pose is the smallest pose seen outside a retract. Gate teaching on: strip out
-  (`rail_now`, `strip_x >= 0`), no flush window, scale 1.0, and not our own write.
-- Never teach the retract pose, and never let a hover-lifted pose become the base: the WindowManager
-  restores the resting pose without calling the hook, so a lifted base stays wrong forever.
+- A base is the pose an animation *settles* on, not a frame from the middle of it. Hovering a tile
+  animates its scale entry away from rest and back; teaching mid-burst bakes that magnification into
+  every later scale, and it looks like a scaling bug rather than a teaching bug.
+- Gate teaching on: strip drawn in the gutter right now (`rail_now`, `strip_x >= 0`), no flush
+  window, scale 1.0, and not our own write. Refuse retract and departure poses geometrically.
+- Poses are stored as raw bytes: cast to `double` before comparing the scale entry, or you compare a
+  single mantissa byte. Translation and scale change independently, so "the pose moved" is not
+  evidence of a relayout.
+- The scale pivot is a constant (`16, 490`) today; if the strip geometry changes on a new build,
+  re-derive it (docs/TECHNICAL.md, Fragility).
 - Act only on a complete state document: `flush` and `rail_now` must be present and fresh. The
   document is published through a seqlock; read the length, then retry if the generation moves.
 
