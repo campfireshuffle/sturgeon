@@ -47,7 +47,7 @@ KEEP=0
 for a in "$@"; do
   case $a in
     --keep-state) KEEP=1 ;;
-    -h|--help) sed -n '2,34p' $SELF; exit 0 ;;
+    -h|--help) sed -n '2,35p' $SELF; exit 0 ;;
     *) print -r -- "teardown: unknown option $a" >&2; exit 2 ;;
   esac
 done

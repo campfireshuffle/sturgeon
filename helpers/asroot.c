@@ -352,6 +352,23 @@ static int wm_running(void) {
     return run_fixed("/usr/bin/pkill", argv) == 0;
 }
 
+// `launchctl bootout` returns before the job has actually exited, and wmshipd writes daemon.json
+// into /tmp/wmship on its way out: removing the directory first lets the dying daemon recreate it
+// (observed: an uninstall "removed /tmp/wmship" and left daemon.json behind).  Wait for the
+// process, then remove.  The pattern is a constant, not input.
+static int daemon_process_running(void) {
+    char *argv[] = {(char *)"/usr/bin/pgrep", (char *)"-f", (char *)"wmshipd.py", NULL};
+    return run_fixed("/usr/bin/pgrep", argv) == 0;
+}
+
+static void wait_for_daemon_exit(void) {
+    for (int i = 0; i < 30 && daemon_process_running(); i++) usleep(100000);
+    if (!daemon_process_running()) return;
+    char *kill[] = {(char *)"/usr/bin/pkill", (char *)"-f", (char *)"wmshipd.py", NULL};
+    run_fixed("/usr/bin/pkill", kill);
+    for (int i = 0; i < 20 && daemon_process_running(); i++) usleep(100000);
+}
+
 // teardown [--keep-state]: the cask's privileged undo.  Fixed order: restore and verify while the
 // helper that can restore still exists, then stop the daemon, then remove the plist and the rule.
 // Every target is a constant or derived from this binary's own tree; nothing comes from argv.
@@ -385,6 +402,8 @@ static int verb_teardown(int keep_state) {
     } else {
         printf("daemon: %s was not loaded\n", target);
     }
+    wait_for_daemon_exit();
+    printf("daemon: no wmshipd.py process remains\n");
 
     pkill_name("wmhb");
     pkill_name("wmobs");

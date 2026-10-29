@@ -76,7 +76,7 @@ for a in "$@"; do
     --run) RUN=1 ;;
     --zap-only) ZAP_ONLY=1 ;;
     --negative) NEGATIVE=1 ;;
-    -h|--help) sed -n '2,49p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) printf 'test-uninstall: unknown option %s\n' "$a" >&2; exit 2 ;;
   esac
 done
@@ -142,6 +142,12 @@ EOS
   exit 2
 fi
 
+# package.sh injects bin/ into the bundle; it does not build it.  Build the helpers from the
+# working tree once so this test can never pass against a stale bin/asroot (a helper fix that was
+# never compiled would otherwise look verified).
+say "building helpers from source (package.sh injects, it does not build)"
+"$ROOT/scripts/build-helpers.sh" >/dev/null 2>&1 || die "scripts/build-helpers.sh failed"
+
 # ---------------------------------------------------------------- assertions
 FAILED=0
 CHECKS=0
@@ -157,6 +163,30 @@ check_absent_root() {
     bad "$2 still exists ($1)"
   fi
 }
+
+# `brew uninstall --cask sturgeon` resolves that token across every installed tap, and a second tap
+# that also ships a cask named sturgeon makes it ambiguous ("Cask sturgeon exists in multiple
+# taps").  The release tap is usually installed on a machine that is testing a release, so move any
+# other sturgeon.rb aside for the run and put it back on the way out.
+CONFLICT_FILES=()
+move_conflicts_aside() {
+  local f
+  for f in "$(brew --repository)"/Library/Taps/*/homebrew-*/Casks/sturgeon.rb; do
+    [ -e "$f" ] || continue
+    case "$f" in *"/sturgeon-proof/"*) continue ;; esac
+    mv "$f" "$f.test-uninstall-backup" || die "cannot move $f aside for the run"
+    CONFLICT_FILES+=("$f")
+  done
+  [ "${#CONFLICT_FILES[@]}" = 0 ] || ok "moved ${#CONFLICT_FILES[@]} other sturgeon cask(s) aside so the token is unambiguous"
+}
+restore_conflicts() {
+  local f
+  [ "${#CONFLICT_FILES[@]}" = 0 ] && return 0
+  for f in "${CONFLICT_FILES[@]}"; do
+    [ -e "$f.test-uninstall-backup" ] && mv "$f.test-uninstall-backup" "$f"
+  done
+}
+trap restore_conflicts EXIT INT TERM
 
 assert_pristine() {   # assert_pristine <strict>
   local strict=${1:-1}
@@ -300,6 +330,7 @@ install_and_arm() {
 }
 
 # ---------------------------------------------------------------- pass 1: armed uninstall
+move_conflicts_aside
 if [ "$ZAP_ONLY" = 0 ]; then
   say "pass 1/4: ARMED uninstall (#21)"
   install_and_arm
@@ -386,8 +417,13 @@ ZAP_LOG=$(mktemp "${TMPDIR:-/tmp}/sturgeon-zap.XXXXXX") || die "no scratch file"
 brew_uninstall "$ZAP_LOG" --zap
 [ "$LAST_RC" = 0 ] || bad "brew uninstall --zap exited $LAST_RC"
 grep -q 'patch: disarmed' "$ZAP_LOG" && ok "zap pass disarmed first" || bad "zap pass did not disarm"
-assert_uninstalled 1 || exit 1
+# The zap assertion has to be made BEFORE anything privileged runs again: install.py resolves the
+# console user's home even under sudo, so the first `pristine` re-creates the (empty) cache
+# directory.  That is the tool's normal cache, not leftover state; the marker below is what proves
+# the user state was really removed.
 check_absent "$SUPPORT" "the Application Support state (--zap)"
+assert_uninstalled 1 || exit 1
+check_absent "$SUPPORT/test-uninstall-marker" "the planted user-state marker (--zap)"
 check_absent_root /tmp/wmship "/tmp/wmship (--zap)"
 rm -f "$ZAP_LOG"
 
