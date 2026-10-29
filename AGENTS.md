@@ -131,8 +131,8 @@ concurrent installs invalidate each other.
   pointer input is `wmship.sh resize`, which sweeps the tiles because that is the shipped path.
 - Before offering or claiming resize works, run `wmship.sh selfcheck`. It applies a 1.2 probe with
   teaching off, requires every tile within 2%, then restores the caller's scale; the strip visibly
-  scales for a few seconds. It is a CLI preflight today — the app's slider is still enabled on
-  `armed` alone, so do not describe the UI as gated by it.
+  scales for a few seconds. The app runs it when the popover opens and withholds the size slider
+  until it passes; the pass path on a live armed install is still an owner check.
 - The app's diagnostics panel, gesture resize and drop-to-tile paths are unit-tested at their pure
   seams only; none has been exercised against an armed WindowManager. Label them implemented but
   unverified.

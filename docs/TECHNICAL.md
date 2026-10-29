@@ -96,8 +96,10 @@ other (#6):
 `--mode pristine|armed|auto` selects explicitly. `auto` is the default and follows `state.json`'s
 pid. An explicit mode the state cannot support is a refusal: asking for `armed` when nothing of
 ours is installed fails instead of falling back to `pristine`, because that downgrade would turn
-"our patch is inconsistent" into a pass. `doctor` is read-only; `--wm-binary` validates a copy and
-can only be pristine.
+"our patch is inconsistent" into a pass. With `--json`, `doctor` is read-only — that is the shape the
+daemon calls, so it can never clear a crash. A human run (no `--json`) clears the daemon's crash
+marker on success by unlinking `crash.json`; that is the deliberate way a machine's crash block is
+released. `--wm-binary` validates a copy and can only be pristine.
 
 The daemon's re-apply gate is deliberately the pristine case: it installs only when the running
 WindowManager is not the one `state.json` describes (a new pid, after a restart or an OS update),
@@ -179,9 +181,10 @@ and demands every tile read `1.2 × natural` within 2%. A base taught from a hov
 leave the strip somewhere else. It never teaches. The probe is visible: the strip scales to 1.2 for
 a few seconds and back.
 
-`selfcheck` is available as `wmship.sh selfcheck` (and the helper's `selfcheck` verb). On this
-build the app's slider is enabled on `armed` alone and does not call it, so the preflight is not yet
-wired into the control; treat that wiring as unverified.
+`selfcheck` is available as `wmship.sh selfcheck` (and the helper's `selfcheck` verb). The app runs
+it when the popover opens and withholds the size slider until it passes (#35); the pass path on a
+live armed install has not been observed, so that gate is implemented and unit-tested but still an
+owner check.
 
 ### The strip keeper
 
@@ -314,9 +317,11 @@ The quiet ones are the reason the resize path verifies every tile against a fres
 size and reports per-tile ratios instead of a single boolean. They are also why the keeper is meant
 to publish a decision trace — `m0`, the base value, and the retract/departure/lift verdicts — so a
 wrong ratio can be diagnosed without a debugger. That trace is **not in this payload build**:
-`payload.c` parses no `trace` key (#31), the app's toggle writes the key but is gated off, and
-`wmship.sh` has no trace verb. Until it lands, the evidence is `wmship.sh poses` (the pose table),
-`wmship.sh counters`, and the per-tile ratios from `resize`.
+`payload.c` parses no `trace` key (#31). The app's toggle is deliberately inert — it is permanently
+disabled with a note and writes nothing, because #25 removed `ConfigChange.trace` and
+`PayloadConfig.trace` — and `wmship.sh` has no trace verb. #31 is what would make the key real.
+Until it lands, the evidence is `wmship.sh poses` (the pose table), `wmship.sh counters`, and the
+per-tile ratios from `resize`.
 
 The display assumptions are also unmeasured beyond one built-in display; what the code assumes and
 the measurements that would replace those assumptions are in
@@ -328,9 +333,11 @@ Known weak points, in the order they are worth hardening:
    so a different display or a moved strip cannot scale about the wrong point.
 2. **Settle windows are time-based.** Replacing them with "the value has stopped changing" would
    remove the timing assumption entirely.
-3. **The resize preflight is not wired into the app.** `selfcheck` can prove the teach state, but
-   the slider's `disabled` state is still `armed`/busy alone, so a broken install reaches the
-   control that `selfcheck` would have refused.
+3. **The resize preflight is a measurement, not a repair.** `selfcheck` applies a 1.2 probe with
+   teaching off, requires every tile within 2%, then restores the caller's scale. The app runs it
+   when the popover opens and withholds the size slider until it passes (#35); the pass path on a
+   live armed install still needs owner verification. It cannot fix a wrong base — only
+   `wmship.sh teach` re-learns the bases.
 
 ## Performance
 
@@ -386,6 +393,6 @@ What has actually been exercised, and what has not, on the current tree:
 | Strip-on-top | owner-verified: 6/6 tiles at layer 3 above a flush window, three trials with zero taught bases and three with thirteen, still out 2 s later |
 | Resize | owner-verified: every tile 1.490–1.500 at 1.5 and 0.600–0.612 at 0.6, exact restore of x/y/w/h |
 | Births | implemented, **unverified end-to-end**: the last two attempts injected nothing (`inject=0`) and the window became a strip tile |
-| `selfcheck` | logic unit-tested with a fake strip; the visible probe has not been run on this build |
+| `selfcheck` | logic and app gate unit-tested (#35); the pass path on a live armed install has not been observed — owner check |
 | App diagnostics, gesture resize, drop-to-tile | decision code unit-tested; live paths **not exercised** against an armed WindowManager |
-| Pose trace | **absent** from this payload build (#31); the app's toggle is gated off |
+| Pose trace | **absent** from this payload build (#31); the app's control is permanently disabled and writes nothing |
