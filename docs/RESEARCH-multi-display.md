@@ -11,9 +11,12 @@ facts, and the shape of the change if the answer turns out to be "the tiles are 
 `CGWindowListCopyWindowInfo`, `CGDisplayBounds` and the WindowManager's accessibility frames all report
 in one global display space. Its origin is the top-left of the main display. A display arranged to the
 right of the main one starts at positive x, one arranged above or to the left has negative y or x.
-Nothing in the code converts between displays, because nothing in the code knows there is more than one:
-there is no call to `CGGetActiveDisplayList`, `NSScreen.screens` or any CGS display API anywhere in
-`Sources/`, `wmship/`, `wm/`, `helpers/` or `a/`.
+Nothing in the code converts between displays and nothing enumerates them: there is no call to
+`CGGetActiveDisplayList`, `NSScreen.screens` or any CGS display API anywhere in `Sources/`, `wmship/`,
+`wm/`, `helpers/` or `a/`. There is exactly one display-aware call, `NSScreen.main` in
+`revealStrip()`, and it hard-codes the main display: the hover height comes from the main screen and the
+glide starts at x = 260, which is a point on the main display. The reveal therefore cannot reach a strip
+on any other display.
 
 The consequence is that every strip test in the shipped path is an x-interval test on the main display's
 left edge. That is exact for one display and meaningless for a second one.
@@ -34,7 +37,7 @@ left edge. That is exact for one display and meaningless for a second one.
 | 10 | At most 32 rail ids and 48 poses are needed. | `MAXIDS`, `MAXP` in `wmship/payload.c` |
 | 11 | One state document, one generation, 16 KB, describes the whole system. | `publish_st()` in `wmship/wmhb.c` |
 | 12 | The stage model is one `sm.space` group containing one `sm.strip` list, and stages are that list's buttons. | `WM.stages()` and `stripElement()` in `a/stagepilot.swift` |
-| 13 | The gutter is 285 points and the strip is revealed by hovering at the main screen's mid-height. | `gutter()`, `revealStrip()` in `a/stagepilot.swift` |
+| 13 | The gutter is 285 points; the strip is revealed by hovering at the main screen's mid-height from x = 260, and is considered out only when its frame's x is ≥ 0. | `gutter()`, `revealStrip()`, `stripIsOut()` in `a/stagepilot.swift` |
 
 Assumption 3 is the load-bearing one. `rail_now` is the array the keeper repairs poses from, and its
 membership test is `f.minX >= 0` plus an upper bound of 300. A strip on a display arranged to the left
@@ -47,7 +50,7 @@ measurement has to say which one disagreed:
 
 | test | condition on a window |
 |---|---|
-| `rail` (`r21obs`) | `minX > -420`, `maxX <= 320`, 8 ≤ width ≤ 320, height ≤ 520 |
+| `rail` (`r21obs`) | `minX > -420`, `maxX <= 320`, width ≤ 320, height ≤ 520 |
 | `rail_now` (`r21obs`) | `minX >= 0`, `maxX <= 300`, 8 ≤ width ≤ 300, 8 ≤ height ≤ 560 |
 | `measure()` (`wmctl`) | `0 <= x < 320`, 8 ≤ width ≤ 330, 8 ≤ height ≤ 560 |
 
@@ -116,8 +119,9 @@ document" from "the keeper decided not to act".
 
 ### 3.1 Configuration and geometry
 
-1. Reveal the strip by hovering at the left edge of each display in turn. Record whether a strip appears
-   on the second display at all, and its frame.
+1. Reveal the strip by hovering at the left edge of each display in turn, by hand: the reveal helper in
+   `stagepilot` is main-display only (§1), so it cannot do this for a second display. Record whether a
+   strip appears on the second display at all, and its frame.
 2. Dump the WindowManager's accessibility tree once per configuration. Today the tree exposes a single
    `sm.space` group with one `sm.strip` child; record whether a second group or a second strip child
    appears, and each one's frame. `bin/stagepilot stages` prints stage frames and window ids from that
@@ -166,10 +170,16 @@ Change the scaled mode of one display, then, without restarting anything:
 2. Whether the scale still lands: `wmship.sh resize <s>` reports a ratio per tile against each tile's
    recorded natural width. A ratio far from `s` on the changed display, with correct ratios elsewhere,
    is a pivot or base problem confined to that display.
-3. Whether the verification itself is trustworthy. `apply_scale()` keeps its natural-width record keyed
-   by window id and refreshes it only when the *set* of ids changes. A resolution change that keeps the
-   same tiles does not refresh the record, so the reported ratio can be wrong in either direction. Treat
-   the first post-change ratio as suspect and re-run `resize 1.0` first.
+3. Whether the verification itself is trustworthy. `apply_scale()` keeps its natural-width record in
+   `/tmp/wmship/natural.json`, keyed by window id, and refreshes it only when the *set* of live tile ids
+   differs from the record. A resolution change that keeps the same tiles therefore leaves stale
+   denominators, and every reported ratio is then measured against the old widths: on a display whose
+   point width changed by a factor k, a correctly scaled strip can report roughly `s·k` or `s/k`
+   depending on the direction of the change. Correct procedure after a resolution change: remove the
+   record first (`sudo rm -f /tmp/wmship/natural.json`), then run `./wmship.sh resize <s>`. The next
+   call finds an empty record, differs from the live id set, forces scale 1.0, re-measures every tile,
+   rewrites the file and only then applies `s`. Closing and reopening one tile also changes the id set,
+   but deleting the record is exact and does not disturb the stage.
 4. Where the tiles drift. If scaling is applied about `(16, 490)` on a display whose strip is elsewhere,
    the error is a translation proportional to `(1 - 1/s)` times the distance from that pivot. Recording
    tile positions at `s = 1.0`, `1.2` and `1.5` gives the pivot back by fitting: the point that does not
@@ -190,7 +200,7 @@ Rows are configurations. Columns are the checks. Fill each cell with the observe
 
 | config | strip on 2nd display | `rail_now` sees it | one strip or per display | tile click switches | `flush` fires | resize ratio per tile | on-top holds | document complete | notes |
 |---|---|---|---|---|---|---|---|---|---|
-| one display, 1512×982 (baseline) | n/a | – | one | – | – | – | – | – | already measured |
+| one display, 1512×982 (baseline) | n/a | n/a | one `sm.space` → one `sm.strip` | not re-run here | yes by construction for `minX <= 2`, width 1512 ≥ 1200 | not re-run here; see `docs/TECHNICAL.md` | recorded in `docs/TECHNICAL.md` | yes, when the document is complete and fresh | baseline; all other rows blank |
 | + external, arranged right | | | | | | | | | |
 | + external, arranged left | | | | | | | | | |
 | + external, arranged above | | | | | | | | | |
@@ -263,7 +273,8 @@ Verified while writing this note:
 | claim | how |
 |---|---|
 | The machine has exactly one active display: built-in, 3024×1964 at 2×, i.e. 1512×982 points. | `system_profiler SPDisplaysDataType`, `sw_vers` (macOS 27.0.1, build 26A434) |
-| No code enumerates displays or reads a Space identifier. | search for `CGGetActiveDisplayList`, `NSScreen`, CGS display and Spaces APIs |
+| No code enumerates displays or reads a Space identifier; the only `NSScreen` use anywhere is `NSScreen.main` in `stagepilot`'s reveal. | search for `CGGetActiveDisplayList`, `NSScreen`, CGS display and Spaces APIs |
+| The single display-aware call, in `stagepilot`'s reveal, is main-display only: the hover height comes from `NSScreen.main`, the glide starts at x = 260, and the strip counts as out only when its frame's x is ≥ 0. | `revealStrip()`, `stripIsOut()` in `a/stagepilot.swift` |
 | The rail and flush tests are main-display x-interval tests, as listed in §2. | read of `helpers/r21obs.swift`, `wm/wmctl.py` `measure()`, `wmship/payload.c` |
 | The pivot is one constant applied to every tile. | `G.qx`/`G.qy` defaults and `mat_scale()` |
 | The natural-width record is keyed by window id and refreshed only when the id set changes. | `apply_scale()` in `wmship/ctl.py` |
@@ -278,6 +289,6 @@ Unverified, and therefore not claimed:
 - Whether a transform for a second display's window can be committed through the main CGS connection.
 - Multi-Space behaviour, separate Spaces per display, and Stage Manager off/on while armed.
 
-Until a row of the matrix is filled, the honest description of this area is "works on one display,
-untested elsewhere", and the arm-time refusal in §5 is the only part of the design that can be written
-without measuring.
+Until a row beyond the single-display baseline is filled, the honest description of this area is "works
+on one display, untested elsewhere", and the arm-time refusal in §5 is the only part of the design that
+can be written without measuring.
