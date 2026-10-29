@@ -41,10 +41,11 @@ LABEL=$PLIST_LABEL
 
 have_root() {
   [ "$(id -u)" = 0 ] && return 0
-  sudo -n "$ASROOT" -c true >/dev/null 2>&1
+  sudo -n "$ASROOT" probe >/dev/null 2>&1
 }
 # bin/asroot is a compiled, verb-limited dispatcher: it accepts a fixed verb list and never runs
-# a shell command.  `-c true` is only for the root probe above (and the Swift app's legacy shapes).
+# a shell command.  The root probe is its own verb (`probe`); the app's three legacy `-c`
+# shapes are accepted only by legacy_command().
 asroot() { if [ "$(id -u)" = 0 ]; then "$ASROOT" "$@"; else sudo -n "$ASROOT" "$@"; fi; }
 need_root() {
   if ! have_root; then
@@ -115,14 +116,14 @@ except Exception:
     print(0)
 PYEOF
 )
-    if [ "$SAME" = "1" ] && $PY $S/install.py status 2>/dev/null | grep -q "^state: *ARMED"; then
+    if [ "$SAME" = "1" ] && asroot status 2>/dev/null | grep -q "^state: *ARMED"; then
       observers_start
       daemon_load || echo "wmship: warning — could not load the LaunchDaemon"
       echo "== already armed with this payload image =="
-      $PY $S/install.py status 2>/dev/null || true
+      asroot status 2>/dev/null || true
       exit 0
     fi
-    if [ "$SAME" = "0" ] && $PY $S/install.py status 2>/dev/null | grep -q "^state: *ARMED"; then
+    if [ "$SAME" = "0" ] && asroot status 2>/dev/null | grep -q "^state: *ARMED"; then
       # A rebuilt payload must not be doctor-tested against our own live patch: restore first.
       echo "== payload image changed — restoring the pristine sites before the doctor =="
       asroot uninstall >/dev/null 2>&1 || true
@@ -138,7 +139,7 @@ PYEOF
       pgrep -x wmhb >/dev/null 2>&1 && break
     done
     echo "== status =="
-    $PY $S/install.py status
+    asroot status
     ;;
   stop)
     need_root

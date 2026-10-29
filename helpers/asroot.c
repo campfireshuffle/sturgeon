@@ -497,7 +497,7 @@ static void legacy_command(const char *cmd) {
 static int verb_known(const char *v) {
     static const char *known[] = {
         "doctor", "status", "pristine", "install", "uninstall", "log",
-        "daemon-load", "arm", "daemon-unload", "disarm", "daemon-status",
+        "probe", "daemon-load", "arm", "daemon-unload", "disarm", "daemon-status",
         "remove-state", "teardown", "move", "resize", "teach", "selfcheck",
         "level", "cfg", "warm", "measure", "state", "poses", NULL,
     };
@@ -510,13 +510,13 @@ static void verbs(void) {
     puts("asroot — privileged verbs (no shell):\n"
          "  doctor [--json] [--no-live] [--mode pristine|armed|auto]\n"
          "  status [--json]   pristine   install   uninstall   log   selfcheck   teach\n"
-         "  daemon-load|arm   daemon-unload|disarm   daemon-status   remove-state\n"
+         "  probe   daemon-load|arm   daemon-unload|disarm   daemon-status   remove-state\n"
          "  teardown [--keep-state]\n"
          "  move <stage> [--cgid N]   resize <0.4..1.5> [--teach]   level <0|3>   cfg [<json>]\n"
          "  warm | measure | state | poses\n"
          "Every path is derived from this binary's location; there is no sh -c and no stdin.\n"
-         "verbs: doctor status pristine install uninstall log selfcheck teach daemon-load arm "
-         "daemon-unload disarm daemon-status remove-state teardown move resize level cfg warm "
+         "verbs: doctor status pristine install uninstall log selfcheck teach probe daemon-load "
+         "arm daemon-unload disarm daemon-status remove-state teardown move resize level cfg warm "
          "measure state poses");
 }
 
@@ -618,6 +618,10 @@ int main(int argc, char **argv) {
             args[2] = NULL;
         }
         run_install(args);
+    }
+    if (strcmp(verb, "probe") == 0) {
+        if (nargs != 0) refuse("probe takes no arguments");
+        return 0;                               // reached only after need_root()
     }
     if (strcmp(verb, "pristine") == 0 || strcmp(verb, "install") == 0 ||
         strcmp(verb, "uninstall") == 0 || strcmp(verb, "log") == 0) {

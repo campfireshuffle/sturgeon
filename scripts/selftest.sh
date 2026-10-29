@@ -209,6 +209,32 @@ else
   fail "wmship.sh calls a verb the helper does not implement"
 fi
 
+# A `-c` passthrough (or a direct install.py/ctl.py call) in the shipped scripts is a failure,
+# not just an unmatched verb: the helper is the only privileged path, and it takes verbs only.
+if /usr/bin/python3 - "$T/wmship.sh" "$T/setup.sh" "$T/teardown.sh" <<'PY'
+import re, sys
+
+problems = []
+for path in sys.argv[1:]:
+    for n, line in enumerate(open(path).read().splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        code = line.split("#", 1)[0]
+        if re.search(r'(?i)\basroot\b', code) and re.search(r'(^|\s)-c(\s|$)', code):
+            problems.append("%s:%d: helper called with -c: %s" % (path, n, line.strip()))
+        if re.search(r'\b(install|ctl)\.py\b', code):
+            problems.append("%s:%d: direct tool invocation, route it through a verb: %s"
+                            % (path, n, line.strip()))
+if problems:
+    print("\n".join(problems), file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  pass "no -c passthrough or direct install.py/ctl.py call in the shipped shell scripts"
+else
+  fail "a shipped shell script passes -c to the helper or calls install.py/ctl.py directly"
+fi
+
 # Every implemented verb must survive parsing without root: exit 1 ("must run as root"), never 2
 # (refused/unknown).  A verb that only exists in the --verbs text but not in dispatch exits 2.
 if [ "$(id -u)" != 0 ]; then

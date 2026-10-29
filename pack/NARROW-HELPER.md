@@ -32,6 +32,7 @@ argv itself and exposes only fixed verbs:
 | `pristine` | `install.py pristine` (byte-exact site check) |
 | `install` / `uninstall` | write / restore the six sites |
 | `log` | `install.py log` |
+| `probe` | the NOPASSWD root probe: exits 0 as root, 1 otherwise; this replaced `-c true` so the shipped shell scripts no longer use the passthrough shape at all |
 | `selfcheck` | `ctl.py selfcheck` — the app's slider preflight: proves the strip can be measured and restored at 1.0 before it is offered |
 | `teach` | `ctl.py teach` — record the strip's natural widths once |
 | `daemon-load`, `arm` | render + validate the LaunchDaemon plist, install it 0644 root:wheel, `launchctl bootout` then `bootstrap` |
@@ -47,7 +48,10 @@ argv itself and exposes only fixed verbs:
 `asroot --verbs` ends with a machine-readable `verbs: …` line. `scripts/selftest.sh` parses the
 `asroot <verb>` calls out of `wmship.sh` and fails if any of them is missing from that line, and it
 runs every published verb without root expecting exit 1 (a root-check refusal, not an unknown-verb
-refusal). That is the check that catches a caller landing a new verb before the helper does.
+refusal). It also fails on a `-c` passthrough or a direct `install.py`/`ctl.py` invocation in
+`wmship.sh`, `setup.sh` or `teardown.sh`: the helper is the only privileged path, and it takes
+verbs only. That is the check that catches a caller landing a new verb before the helper does, and
+the regression from #29 where `start`/`status` still spoke the old passthrough shape.
 
 The scale range is **0.4–1.5**, matching `wmship.sh resize`, `ctl.py` and the cask's documentation.
 The helper deliberately rejects anything outside it rather than passing a value the tool would
