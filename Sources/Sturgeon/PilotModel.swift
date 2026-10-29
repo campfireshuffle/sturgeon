@@ -99,8 +99,10 @@ final class PilotModel: ObservableObject {
     // direct (non-sweeping) scale writes used by the gesture
     private var gestureConfig: PayloadConfig?
     private var loadingGestureConfig = false
-    private var pendingGestureScale: Double?
-    private var writingGestureScale = false
+    /// The two halves of "the tap still has a scale write to land".  Both report into the gate,
+    /// which will not start a probe or a resize while either is true.
+    private var pendingGestureScale: Double? { didSet { syncGestureInFlight() } }
+    private var writingGestureScale = false { didSet { syncGestureInFlight() } }
 
     private var dropping = false
 
@@ -564,6 +566,12 @@ final class PilotModel: ObservableObject {
         pumpGestureScale()
     }
 
+    /// Runs on every change of the write pump's two flags.  The gate uses it to keep a probe or
+    /// a resize from starting while the tap is still writing `s` into the payload.
+    private func syncGestureInFlight() {
+        preflight.setGestureInFlight(writingGestureScale || pendingGestureScale != nil)
+    }
+
     private func loadGestureConfig() {
         guard !loadingGestureConfig else { return }
         loadingGestureConfig = true
@@ -574,6 +582,10 @@ final class PilotModel: ObservableObject {
                 if let config {
                     self.gestureConfig = config
                     self.pumpGestureScale()
+                } else {
+                    // Without a config there is no write to land.  Dropping the queued target
+                    // releases the gate; the next gesture event reads the config again.
+                    self.pendingGestureScale = nil
                 }
             }
         }
@@ -582,8 +594,10 @@ final class PilotModel: ObservableObject {
     private func pumpGestureScale() {
         guard let base = gestureConfig, !writingGestureScale,
               let target = pendingGestureScale else { return }
-        pendingGestureScale = nil
+        // Claim the write before clearing the queue entry, so the gate never sees a false
+        // "nothing in flight" between the two assignments.
         writingGestureScale = true
+        pendingGestureScale = nil
         var config = base
         config.values["s"] = target
         config.values["dilate"] = abs(target - 1.0) > 1e-9
@@ -594,7 +608,10 @@ final class PilotModel: ObservableObject {
                 if result.code == 0 {
                     self.gestureConfig = config
                 } else {
+                    // A failed write has no continuation: drop the queued target so the gate
+                    // does not wait for a write that will never finish.
                     self.gestureConfig = nil
+                    self.pendingGestureScale = nil
                     self.lastError = "scale \(String(format: "%.2f", target)) → "
                         + Self.lastLine(result.combined)
                 }

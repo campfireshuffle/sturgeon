@@ -368,6 +368,83 @@ final class PreflightTests: XCTestCase {
         XCTAssertEqual(gate.state, .disarmed)
     }
 
+    // MARK: - a gesture write in flight
+
+    func testGestureWriteInFlightRefusesACheck() throws {
+        var gate = PreflightGate(armed: true)
+        gate.beginCheck()
+        gate.finishCheck(try report(passJSON))
+        XCTAssertTrue(gate.checkEnabled)
+
+        gate.setGestureInFlight(true)
+        XCTAssertTrue(gate.gestureInFlight)
+        XCTAssertFalse(gate.checkEnabled, "a probe must not start while the tap is writing")
+        XCTAssertFalse(gate.sliderEnabled)
+        XCTAssertFalse(gate.beginCheck())
+        XCTAssertEqual(gate.state, .ready, "the gesture is not a verdict; it only withholds the probe")
+        XCTAssertTrue(gate.headline.contains("waiting for the gesture"))
+        XCTAssertEqual(gate.summary, "ready (gesture write in flight)")
+
+        gate.setGestureInFlight(false)
+        XCTAssertTrue(gate.checkEnabled)
+        XCTAssertTrue(gate.sliderEnabled)
+        XCTAssertTrue(gate.beginCheck())
+    }
+
+    func testGestureWriteInFlightRefusesAResize() throws {
+        var gate = PreflightGate(armed: true)
+        gate.beginCheck()
+        gate.finishCheck(try report(passJSON))
+        XCTAssertTrue(gate.sliderEnabled)
+
+        gate.setGestureInFlight(true)
+        XCTAssertFalse(gate.sliderEnabled)
+        XCTAssertFalse(gate.beginResize(), "a resize must not start while the tap is writing")
+        XCTAssertFalse(gate.isResizing)
+
+        gate.setGestureInFlight(false)
+        XCTAssertTrue(gate.beginResize())
+        XCTAssertTrue(gate.isResizing)
+        // The reverse direction still holds: a resize in flight refuses a later check.
+        XCTAssertFalse(gate.checkEnabled)
+        XCTAssertFalse(gate.beginCheck())
+    }
+
+    func testGestureWriteInFlightAlsoWithholdsTheFirstCheck() {
+        var gate = PreflightGate(armed: true)
+        XCTAssertTrue(gate.checkEnabled)
+        gate.setGestureInFlight(true)
+        XCTAssertFalse(gate.checkEnabled, "no probe while the tap still has a write to land")
+        XCTAssertFalse(gate.beginCheck())
+        XCTAssertFalse(gate.sliderEnabled)
+
+        gate.setGestureInFlight(false)
+        XCTAssertTrue(gate.beginCheck())
+    }
+
+    func testRepeatedGestureBitsDoNotInventState() throws {
+        var gate = PreflightGate(armed: true)
+        gate.beginCheck()
+        gate.finishCheck(try report(failJSON))
+        let blocked = gate.state
+        gate.setGestureInFlight(true)
+        gate.setGestureInFlight(true)
+        XCTAssertEqual(gate.state, blocked, "the gesture bit never changes the verdict")
+        XCTAssertEqual(gate.reason, try report(failJSON).refusalLine())
+        gate.setGestureInFlight(false)
+        XCTAssertEqual(gate.state, blocked)
+        XCTAssertFalse(gate.sliderEnabled, "a failure is still a failure after the write lands")
+    }
+
+    func testDisarmClearsAStaleGestureBit() {
+        var gate = PreflightGate(armed: true)
+        gate.setGestureInFlight(true)
+        gate.setArmed(false)
+        XCTAssertFalse(gate.gestureInFlight)
+        gate.setArmed(true)
+        XCTAssertTrue(gate.checkEnabled, "a dropped payload cannot have a write in flight")
+    }
+
     func testHeadlineNeverClaimsReadinessWithoutAVerdict() {        XCTAssertFalse(PreflightGate(armed: false).headline.contains("OK"))
         XCTAssertFalse(PreflightGate(armed: true).headline.contains("OK"))
         var checking = PreflightGate(armed: true)

@@ -31,6 +31,8 @@ public enum PreflightFailure {
 /// * armed, not checked → disabled; a check may be started.
 /// * checking → **both** disabled: the strip is at the probe scale, so a resize would corrupt
 ///   the measurement and a second check would race the first.
+/// * a gesture write in flight → **both** disabled: the tap is still writing a scale into the
+///   payload, so a probe or a resize would measure a strip that is about to move.
 /// * ready → the slider is enabled.
 /// * blocked → disabled with the one-line reason; only a new check (or arming again) clears it.
 ///
@@ -55,6 +57,10 @@ public struct PreflightGate: Equatable {
     public private(set) var state: State
     /// A resize is in flight; `checkEnabled` is false while it is.
     public private(set) var resizing: Bool
+    /// A gesture scale write is in flight (or queued behind one).  The tap writes the payload's
+    /// `s` directly at up to 60 Hz, so a probe or a resize started in that window would measure
+    /// a strip that is about to move again.
+    public private(set) var gestureInFlight: Bool
     /// The newest report, kept for the diagnostics block.  Its verdict is in `state`.
     public private(set) var lastReport: SelfcheckReport?
 
@@ -62,17 +68,22 @@ public struct PreflightGate: Equatable {
         self.armed = armed
         self.state = armed ? .unchecked : .disarmed
         self.resizing = false
+        self.gestureInFlight = false
         self.lastReport = nil
     }
 
     // MARK: - what the UI may do
 
     /// The size slider (and Reset) is offered only after a check passed, and never while the
-    /// probe or a resize is in flight.
-    public var sliderEnabled: Bool { armed && state == .ready && !resizing }
+    /// probe, a resize or a gesture write is in flight.
+    public var sliderEnabled: Bool {
+        armed && state == .ready && !resizing && !gestureInFlight
+    }
 
     /// The preflight may be started, on demand or on popover open.
-    public var checkEnabled: Bool { armed && state != .checking && !resizing }
+    public var checkEnabled: Bool {
+        armed && state != .checking && !resizing && !gestureInFlight
+    }
 
     public var isChecking: Bool { state == .checking }
     public var isResizing: Bool { resizing }
@@ -101,24 +112,37 @@ public struct PreflightGate: Equatable {
         case .checking:
             return "Resize preflight: probing the strip — it scales briefly, then returns"
         case .ready:
-            return "Resize preflight: OK — every tile measured at the probe scale"
+            return gestureInFlight
+                ? "Resize preflight: OK — waiting for the gesture's scale write"
+                : "Resize preflight: OK — every tile measured at the probe scale"
         case .blocked(let why):
             return "Resize unavailable — \(why)"
         }
     }
 
-    /// A compact form for the diagnostics block.
+    /// A compact form for the diagnostics block.  A gesture write in flight is named rather than
+    /// left implicit: it is the one condition under which a ready gate still withholds the slider.
     public var summary: String {
+        let verdict: String
         switch state {
-        case .disarmed: return "disarmed"
-        case .unchecked: return "unchecked"
-        case .checking: return "checking"
-        case .ready: return "ready"
-        case .blocked(let why): return "blocked — \(why)"
+        case .disarmed: verdict = "disarmed"
+        case .unchecked: verdict = "unchecked"
+        case .checking: verdict = "checking"
+        case .ready: verdict = "ready"
+        case .blocked(let why): verdict = "blocked — \(why)"
         }
+        return gestureInFlight ? verdict + " (gesture write in flight)" : verdict
     }
 
     // MARK: - transitions
+
+    /// The gesture's write pump reports whether it still has work.  Fed from
+    /// `writingGestureScale || pendingGestureScale != nil`, so the gate sees one transition per
+    /// burst rather than one per pointer event.
+    public mutating func setGestureInFlight(_ value: Bool) {
+        guard value != gestureInFlight else { return }
+        gestureInFlight = value
+    }
 
     /// The status document is the only source of `armed`.  A repeat tick with the same value must
     /// not clear a pass; a real arm/disarm change must, because the payload and the WindowManager
@@ -131,7 +155,12 @@ public struct PreflightGate: Equatable {
         }
         armed = value
         state = value ? .unchecked : .disarmed
-        if !value { resizing = false }
+        if !value {
+            // A disarm drops the payload: no write and no resize survives it, and a stale bit
+            // would block the next check for a gesture that no longer exists.
+            resizing = false
+            gestureInFlight = false
+        }
     }
 
     /// The WindowManager process was replaced (a relaunch, or a crash and recovery).  A pass
@@ -169,11 +198,12 @@ public struct PreflightGate: Equatable {
         state = .blocked(why.isEmpty ? "selfcheck did not return a verdict" : why)
     }
 
-    /// Starts a resize.  Only a passed check permits one; `applyScale` uses this instead of its
-    /// old private `resizing` flag so the two operations share one serialisation point.
+    /// Starts a resize.  Only a passed check, with no gesture write in flight, permits one;
+    /// `applyScale` uses this instead of its old private `resizing` flag so the two operations
+    /// share one serialisation point.
     @discardableResult
     public mutating func beginResize() -> Bool {
-        guard armed, state == .ready, !resizing else { return false }
+        guard sliderEnabled else { return false }
         resizing = true
         return true
     }
