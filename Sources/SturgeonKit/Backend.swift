@@ -90,10 +90,29 @@ public enum Backend {
         let outPipe = Pipe(), errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
-        process.standardInput = FileHandle.nullDevice
-        do { try process.run() } catch {
-            return RunResult(code: -1, out: "", err: "cannot run \(invocation.executable.path): \(error)")
+        // A per-invocation /dev/null, not `FileHandle.nullDevice`: the shared singleton's file
+        // descriptor can be closed by another launch in flight, and posix_spawn then fails with
+        // EBADF ("Bad file descriptor") before the child exists. Open one here and close it after.
+        let devNull = FileHandle(forReadingAtPath: "/dev/null")
+        process.standardInput = devNull ?? FileHandle.standardInput
+        do {
+            try process.run()
+        } catch {
+            let code = (error as NSError).code
+            // EBADF from the spawn file actions: fall back to inherited stdin, which is always a
+            // valid descriptor in a GUI app.
+            if code == 9 {
+                process.standardInput = FileHandle.standardInput
+                do { try process.run() } catch {
+                    devNull?.closeFile()
+                    return RunResult(code: -1, out: "", err: "cannot run \(invocation.executable.path): \(error)")
+                }
+            } else {
+                devNull?.closeFile()
+                return RunResult(code: -1, out: "", err: "cannot run \(invocation.executable.path): \(error)")
+            }
         }
+        devNull?.closeFile()
         var outData = Data(), errData = Data()
         let group = DispatchGroup()
         DispatchQueue.global(qos: .utility).async(group: group) {
