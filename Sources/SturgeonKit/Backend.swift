@@ -125,7 +125,7 @@ public enum Backend {
         case .status, .counters, .configWrite: return "install.py missing"
         case .stages: return "stagepilot missing"
         case .rootProbe: return "asroot missing"
-        case .doctor, .configRead, .start, .stop, .resize, .move, .moveWindow:
+        case .doctor, .configRead, .start, .stop, .resize, .move, .moveWindow, .selfcheck:
             return "wmship.sh missing"
         }
     }
@@ -142,6 +142,10 @@ public enum Backend {
     }
 
     public static func doctor() -> RunResult { run(.doctor) }
+
+    /// The resize preflight.  Its exit code is the CLI's own verdict; the app re-derives it from
+    /// the document (`SelfcheckReport.passed`) because a pass without rows is not evidence.
+    public static func selfcheck() -> RunResult { run(.selfcheck) }
 
     public static func stages() -> [StageItem] {
         StageItem.parse(run(.stages).out)

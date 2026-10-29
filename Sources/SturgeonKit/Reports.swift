@@ -352,6 +352,132 @@ extension ResizeReport: Decodable {
     }
 }
 
+/// `wmship.sh selfcheck` (issue #5) — the resize preflight.
+///
+/// `{ok, s, probe_s, tol, tiles:[{id, owner, w, natural, ratio, want}], restored:[...], err}`
+///
+/// The probe applies `probe_s` (currently 1.2) with teaching off, demands `width / natural` back
+/// as `probe_s ± tol` on every tile, then restores the caller's scale.  A pass is only a pass if
+/// the document also carries the tiles it claims to have measured: an `ok: true` with no rows is
+/// exactly the "silently wrong" state this gate exists to catch, so it does not count.
+public struct SelfcheckReport: Equatable {
+    public var ok: Bool
+    /// The scale the probe restored to (`s`).
+    public var scale: Double?
+    /// The scale the probe applied to make a wrong base visible (`probe_s`).
+    public var probeScale: Double?
+    /// The tolerance the tool used (`tol`).
+    public var tolerance: Double?
+    public var tiles: [Tile]
+    /// The same rows measured after the restore; evidence that the probe left no scale applied.
+    public var restored: [Tile]
+    public var err: String?
+    public var seconds: Double?
+
+    public init(ok: Bool = false, scale: Double? = nil, probeScale: Double? = nil,
+                tolerance: Double? = nil, tiles: [Tile] = [], restored: [Tile] = [],
+                err: String? = nil, seconds: Double? = nil) {
+        self.ok = ok
+        self.scale = scale
+        self.probeScale = probeScale
+        self.tolerance = tolerance
+        self.tiles = tiles
+        self.restored = restored
+        self.err = err
+        self.seconds = seconds
+    }
+
+    /// The tolerance to judge a row by: the tool's, or the 2% the issue specifies.
+    public var effectiveTolerance: Double { tolerance ?? 0.02 }
+
+    /// The ratio a probe row was expected to read.
+    public func wanted(_ tile: Tile) -> Double? { tile.want ?? probeScale }
+
+    public func isWithinTolerance(_ tile: Tile) -> Bool {
+        guard let ratio = tile.ratio else { return false }
+        guard let want = wanted(tile) else { return true }  // no target published; a ratio is all we have
+        return abs(ratio - want) <= effectiveTolerance + 1e-9
+    }
+
+    public var offendingTiles: [Tile] { tiles.filter { !isWithinTolerance($0) } }
+
+    /// The gate's verdict, derived from the evidence rather than trusting `ok` alone.
+    ///
+    /// It refuses: `ok == false`, a document that carries an `err` and an `ok` at once, an empty
+    /// tile list, any row with no measured ratio, and any row outside the tolerance.
+    public var passed: Bool {
+        guard ok else { return false }
+        guard (err ?? "").isEmpty else { return false }
+        guard !tiles.isEmpty else { return false }
+        return offendingTiles.isEmpty
+    }
+
+    /// One line for the popover: the tool's own refusal, then the first offending row.
+    public func refusalLine() -> String {
+        if let err, !err.isEmpty { return err }
+        if let bad = offendingTiles.first {
+            let id = bad.id.map(String.init) ?? "?"
+            let ratio = bad.ratio.map { String(format: "%.3f", $0) } ?? "unknown"
+            let want = wanted(bad).map { String(format: "%.2f", $0) } ?? "?"
+            return "tile \(id) measures \(ratio) × natural at probe \(want), want \(want) ± "
+                + String(format: "%.2f", effectiveTolerance)
+        }
+        if tiles.isEmpty { return "selfcheck measured no strip tiles" }
+        return "selfcheck failed without a reason"
+    }
+
+    public struct Tile: Equatable, Decodable {
+        public var id: Int?
+        public var owner: String?
+        public var width: Double?
+        public var natural: Double?
+        public var ratio: Double?
+        /// The ratio this row was probed at (`want`).
+        public var want: Double?
+
+        public init(id: Int? = nil, owner: String? = nil, width: Double? = nil,
+                    natural: Double? = nil, ratio: Double? = nil, want: Double? = nil) {
+            self.id = id
+            self.owner = owner
+            self.width = width
+            self.natural = natural
+            self.ratio = ratio
+            self.want = want
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, owner, natural, ratio, want
+            case width = "w"
+        }
+    }
+}
+
+extension SelfcheckReport: Decodable {
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Key.self)
+        func v<T: Decodable>(_ key: Key, _ type: T.Type) -> T? {
+            guard let value = try? c.decodeIfPresent(type, forKey: key) else { return nil }
+            return value
+        }
+        ok = v(.ok, Bool.self) ?? false
+        scale = v(.scale, Double.self)
+        probeScale = v(.probeScale, Double.self)
+        tolerance = v(.tolerance, Double.self)
+        tiles = v(.tiles, [Tile].self) ?? []
+        restored = v(.restored, [Tile].self) ?? []
+        err = v(.err, String.self).flatMap { $0.isEmpty ? nil : $0 }
+        seconds = v(.seconds, Double.self)
+    }
+
+    private enum Key: String, CodingKey {
+        case ok, err, tiles, restored
+        case scale = "s"
+        case probeScale = "probe_s"
+        case tolerance = "tol"
+        case seconds = "secs"
+    }
+}
+
 /// `ctl.py move` — `{ok, err, target, cgid, ...}`.
 public struct MoveReport: Equatable {
     public var ok: Bool

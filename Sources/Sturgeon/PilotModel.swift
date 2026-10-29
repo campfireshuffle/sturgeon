@@ -43,6 +43,10 @@ final class PilotModel: ObservableObject {
     @Published var inputRearms = 0
     @Published var stripGutter: CGRect?
 
+    /// The resize preflight (issue #5).  The slider is offered only when this says ready, and a
+    /// check and a resize never overlap.  Every mutation happens on the main thread.
+    @Published var preflight = PreflightGate()
+
     // gesture settings
     @Published var gestureEnabled = true {
         didSet {
@@ -78,7 +82,13 @@ final class PilotModel: ObservableObject {
     private let hud = ScaleHUD()
 
     private var scaleWork: DispatchWorkItem?
-    private var resizing = false
+    /// Set by `popoverOpened()`; consumed once the status document says the payload is armed, so
+    /// the check runs against a fact rather than the last poll's guess.
+    private var preflightPendingOnOpen = false
+    /// Invalidates a completion whose armed state changed while it was in flight.
+    private var selfcheckID = 0
+    /// The WindowManager pid the current verdict belongs to; a change re-opens the gate.
+    private var preflightWMPID: Int?
     private var lastStatusAt = Date.distantPast
     private var lastStagesAt = Date.distantPast
     /// Keeps the strip rect fresh while armed, even with the popover closed.  The gesture needs
@@ -89,8 +99,10 @@ final class PilotModel: ObservableObject {
     // direct (non-sweeping) scale writes used by the gesture
     private var gestureConfig: PayloadConfig?
     private var loadingGestureConfig = false
-    private var pendingGestureScale: Double?
-    private var writingGestureScale = false
+    /// The two halves of "the tap still has a scale write to land".  Both report into the gate,
+    /// which will not start a probe or a resize while either is true.
+    private var pendingGestureScale: Double? { didSet { syncGestureInFlight() } }
+    private var writingGestureScale = false { didSet { syncGestureInFlight() } }
 
     private var dropping = false
 
@@ -127,6 +139,22 @@ final class PilotModel: ObservableObject {
     }
 
     // MARK: - refresh
+
+    /// The popover is where the slider is offered, so this is where the preflight runs.  The
+    /// check itself waits for a fresh status document: a stale `armed = false` after `wmship.sh
+    /// start` in a terminal must not silently skip it.
+    func popoverOpened() {
+        preflightPendingOnOpen = true
+        refresh(stages: true)
+    }
+
+    /// Called at the end of every successful status decode; runs the deferred check once.
+    private func consumePendingPreflight() {
+        guard preflightPendingOnOpen else { return }
+        preflightPendingOnOpen = false
+        guard armed else { return }
+        runSelfcheck()
+    }
 
     func refresh(doctor: Bool = false, stages: Bool = false) {
         if doctor { runDoctor() }
@@ -209,6 +237,11 @@ final class PilotModel: ObservableObject {
                 doctorOK = false
                 debugger = debuggerFallback
                 doctorRefusal = "no root: press Set Up (one administrator approval)"
+                // No payload, no preflight: a pending check is dropped rather than run against a
+                // document we could not read.
+                preflightPendingOnOpen = false
+                selfcheckID += 1
+                preflight.setArmed(false)
                 updateInputs()
             } else if !r.combined.isEmpty {
                 footer = msg.isEmpty ? "status failed" : msg
@@ -230,7 +263,9 @@ final class PilotModel: ObservableObject {
             births = caps.births
             onTop = caps.replay && caps.levels
             level3 = caps.levelManual == 3
-            if !isEditingScale, let s = caps.scale { scale = s }
+            // The probe briefly writes `s = probe_s`; the 2 s status tick must not animate the
+            // slider (or the gesture's base) to a scale the tool is about to restore.
+            if !isEditingScale, !preflight.isChecking, let s = caps.scale { scale = s }
         } else if !armed {
             births = false
             onTop = false
@@ -238,6 +273,25 @@ final class PilotModel: ObservableObject {
         }
         inputTap.setBaseScale(scale)
         updateInputs()
+        syncPreflight(armed: report.isArmed)
+    }
+
+    /// Keeps the gate in step with the status document.  A real arm/disarm change, or a new
+    /// WindowManager pid, invalidates a check in flight: a probe launched against the previous
+    /// process must not decide the new one.
+    private func syncPreflight(armed value: Bool) {
+        if value != preflight.armed { selfcheckID += 1 }
+        preflight.setArmed(value)
+        if !value {
+            preflightWMPID = nil
+        } else if let seen = preflightWMPID, let now = pid, seen != now {
+            selfcheckID += 1
+            preflight.invalidate()
+            preflightWMPID = now
+        } else if preflightWMPID == nil {
+            preflightWMPID = pid
+        }
+        consumePendingPreflight()
     }
 
     /// The tap is installed only while armed; disarming uninstalls it, which is what keeps a
@@ -358,11 +412,65 @@ final class PilotModel: ObservableObject {
         }
     }
 
+    // MARK: - resize preflight (issue #5)
+
+    /// Runs `wmship.sh selfcheck`, on popover open and on demand.  The gate refuses a second
+    /// check while one is in flight and refuses to start one during a resize.
+    ///
+    /// While it runs the strip is visibly at the probe scale; the popover says so and the slider
+    /// stays disabled, so neither a second check nor a resize can race the measurement.
+    func runSelfcheck() {
+        guard armed else {
+            preflightPendingOnOpen = false
+            preflight.setArmed(false)
+            footer = "preflight → not armed (nothing to measure)"
+            return
+        }
+        // Consume the on-open request either way: this call is the answer to it.
+        preflightPendingOnOpen = false
+        guard preflight.beginCheck() else {
+            // A check already running owns the footer; say nothing and leave it alone.
+            if preflight.isResizing { footer = "preflight → wait for the resize in flight" }
+            return
+        }
+        selfcheckID += 1
+        let id = selfcheckID
+        busy = true
+        footer = "preflight → probing the strip at the probe scale (it scales briefly)…"
+        Backend.queue.async {
+            let result = Backend.selfcheck()
+            DispatchQueue.main.async {
+                guard id == self.selfcheckID else {
+                    // An arm/disarm change superseded this run; a newer check owns `busy`.
+                    if !self.preflight.isChecking { self.busy = false }
+                    return
+                }
+                self.busy = false
+                if let report = result.decode(SelfcheckReport.self) {
+                    self.preflight.finishCheck(report)
+                } else {
+                    self.preflight.failCheck(PreflightFailure.line(for: result))
+                }
+                if let reason = self.preflight.reason {
+                    self.footer = "preflight → " + reason
+                    self.lastError = reason
+                } else if self.preflight.isReady {
+                    let tiles = self.preflight.lastReport?.tiles.count ?? 0
+                    self.footer = "preflight → ok, \(tiles) tile(s) at the probe scale"
+                }
+                self.refresh()
+            }
+        }
+    }
+
     // MARK: - resize (slider, sweep-based)
 
     /// The slider applies on release; a short debounce also covers an accessibility-driven value
     /// change that never sends `onEditingChanged(false)`.
     func sliderChanged(_ v: Double) {
+        // A disabled slider must not even move its readout: the strip is at the probe scale or
+        // the bases have not been verified, and a value the tool will not apply is a lie.
+        guard preflight.sliderEnabled else { return }
         scale = v
         scaleWork?.cancel()
         let w = DispatchWorkItem { [weak self] in self?.applyScale(v) }
@@ -371,6 +479,10 @@ final class PilotModel: ObservableObject {
     }
 
     func resetScale() {
+        guard preflight.sliderEnabled else {
+            footer = "resize → preflight " + (preflight.reason ?? "has not passed")
+            return
+        }
         scale = 1.0
         applyScale(1.0)
     }
@@ -380,14 +492,22 @@ final class PilotModel: ObservableObject {
             footer = "not armed — resize needs the payload"
             return
         }
-        guard !resizing else { return }
-        resizing = true
+        // One serialisation point for "a resize and a preflight never overlap": beginResize
+        // refuses while a check is in flight and refuses before a check has passed.
+        guard preflight.beginResize() else {
+            if preflight.isChecking {
+                footer = "resize → waiting for the preflight to finish"
+            } else {
+                footer = "resize → preflight " + (preflight.reason ?? "has not passed")
+            }
+            return
+        }
         busy = true
         footer = "resize \(Int((s * 100).rounded()))% → sweeping…"
         Backend.queue.async {
             let r = Backend.run(.resize(scale: s))
             DispatchQueue.main.async {
-                self.resizing = false
+                self.preflight.endResize()
                 self.busy = false
                 if let report = r.decode(ResizeReport.self) {
                     self.lastResize = report
@@ -417,13 +537,19 @@ final class PilotModel: ObservableObject {
     /// Writes are coalesced to one in flight: the tap produces up to 60 targets a second, while a
     /// config write is a short root round-trip.  The latest target is applied as soon as the
     /// previous write finishes, so the strip follows the gesture without a backlog.
+    ///
+    /// A probe or a resize owns the strip while it runs: a config write in the middle of either
+    /// would change the geometry being measured.  The gesture is ignored — without moving the
+    /// readout — until that work finishes.
     private func gestureScale(_ value: Double) {
+        guard !preflight.isChecking, !preflight.isResizing else { return }
         scale = value
         hud.show("Strip \(Int((value * 100).rounded()))%")
         enqueueDirectScale(value)
     }
 
     private func gestureEnded(_ value: Double) {
+        guard !preflight.isChecking, !preflight.isResizing else { return }
         scale = value
         hud.show("Strip \(Int((value * 100).rounded()))%")
         enqueueDirectScale(value)
@@ -434,10 +560,16 @@ final class PilotModel: ObservableObject {
     }
 
     private func enqueueDirectScale(_ value: Double) {
-        guard armed else { return }
+        guard armed, !preflight.isChecking, !preflight.isResizing else { return }
         pendingGestureScale = value
         if gestureConfig == nil { loadGestureConfig() }
         pumpGestureScale()
+    }
+
+    /// Runs on every change of the write pump's two flags.  The gate uses it to keep a probe or
+    /// a resize from starting while the tap is still writing `s` into the payload.
+    private func syncGestureInFlight() {
+        preflight.setGestureInFlight(writingGestureScale || pendingGestureScale != nil)
     }
 
     private func loadGestureConfig() {
@@ -450,6 +582,10 @@ final class PilotModel: ObservableObject {
                 if let config {
                     self.gestureConfig = config
                     self.pumpGestureScale()
+                } else {
+                    // Without a config there is no write to land.  Dropping the queued target
+                    // releases the gate; the next gesture event reads the config again.
+                    self.pendingGestureScale = nil
                 }
             }
         }
@@ -458,8 +594,10 @@ final class PilotModel: ObservableObject {
     private func pumpGestureScale() {
         guard let base = gestureConfig, !writingGestureScale,
               let target = pendingGestureScale else { return }
-        pendingGestureScale = nil
+        // Claim the write before clearing the queue entry, so the gate never sees a false
+        // "nothing in flight" between the two assignments.
         writingGestureScale = true
+        pendingGestureScale = nil
         var config = base
         config.values["s"] = target
         config.values["dilate"] = abs(target - 1.0) > 1e-9
@@ -470,7 +608,10 @@ final class PilotModel: ObservableObject {
                 if result.code == 0 {
                     self.gestureConfig = config
                 } else {
+                    // A failed write has no continuation: drop the queued target so the gate
+                    // does not wait for a write that will never finish.
                     self.gestureConfig = nil
+                    self.pendingGestureScale = nil
                     self.lastError = "scale \(String(format: "%.2f", target)) → "
                         + Self.lastLine(result.combined)
                 }
@@ -561,6 +702,9 @@ final class PilotModel: ObservableObject {
                 self.apply(status: st)
                 self.runDoctor()
                 self.refreshStages()
+                // A freshly armed payload has no verdict yet; the slider must not wait for the
+                // next popover open to become usable.
+                if self.armed { self.runSelfcheck() }
             }
         }
     }
@@ -633,6 +777,7 @@ final class PilotModel: ObservableObject {
             counters: fullCounters,
             countersNote: countersNote,
             resize: lastResize,
+            preflight: preflight,
             lastError: lastError,
             gesture: inputStatus,
             ambiguousDrops: ambiguousDrops,
