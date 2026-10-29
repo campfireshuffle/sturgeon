@@ -39,13 +39,18 @@ Three consequences, in the order they kill the idea:
 
 ## What *is* worth deriving
 
-The pivot, and only the pivot. `mat_scale()` scales about a constant point `(16, 490)` — a point in
-the strip gutter — and that constant is the one genuinely fragile number in the keeper: a different
-display size or a moved strip scales about the wrong point, quietly. The strip's own rect is in the
-document (`rail_x`, and the strip frame the observer reports), so the pivot can be expressed as a
-function of that rect and checked against `(16, 490)` on this build before it replaces it. That is a
-separate, smaller change, and it should be measured the same way the base was: hold the strip at a
-known rect, scale 1.5, and compare per-tile geometry against the constant.
+The pivot — and it now is derived. `mat_scale()` scales every tile about one point, and that point
+used to be the constant `(16, 490)`, a point in the strip gutter on exactly one display. The state
+document carries each drawn app tile's frame, so `rail_geom()` takes the leftmost drawn app tile's
+`x` and the vertical centre of the drawn app tiles' extent for every accepted document.
+WindowManager's own gutter and overlay windows are excluded because they move under the pointer. If
+no app tile is drawn, the scale is refused and counted (`pivmiss`) rather than applied about a guess.
+
+The derivation is measured against the constant on the reference display. The fixed point of the
+scale read back from the tiles (`p = x + (x − x′)/(s − 1)`, with `x` at 1.0 and `x′` at 1.5) is
+`x 13–16, y 507–509`; with `pivot_fixed` pinned to `(16, 490)` the same calculation gives
+`x 15–17, y 489–491`. The constant was about 18 px off in y. Width ratios cannot see that: they stay
+correct while the tiles move.
 
 ## What would change the verdict
 

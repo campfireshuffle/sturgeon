@@ -42,7 +42,8 @@ swift test                       # the package tests (no root, no WindowManager)
 ./wmship.sh status               # build, ARMED, capabilities, debugger: none
 ./wmship.sh selfcheck            # resize preflight: probes at 1.2, then restores
 ./wmship.sh resize 0.6           # numeric per-tile check
-./wmship.sh resize 1.0
+./wmship.sh resize 1.0           # ratios, and x/y restoration
+./wmship.sh trace                # keeper decision ring (after cfg trace=true)
 ./wmship.sh stop                 # restore byte-exact and verify
 ./wmship.sh pristine             # PRISTINE: yes
 ./scripts/selftest.sh            # bundle invariants; no root, no WindowManager
@@ -90,16 +91,28 @@ concurrent installs invalidate each other.
 - Poses are stored as raw bytes: cast to `double` before comparing the scale entry, or you compare a
   single mantissa byte. Translation and scale change independently, so "the pose moved" is not
   evidence of a relayout.
-- The scale pivot is a constant (`16, 490`) today; if the strip geometry changes on a new build,
-  re-derive it (docs/TECHNICAL.md, Fragility; docs/RESEARCH-multi-display.md).
+- The scale pivot is **derived** per accepted state document from the rail: the leftmost drawn
+  **app** tile's `x` and the vertical centre of the drawn app tiles' extent. WindowManager's own
+  gutter and overlay windows are excluded, because they move under the pointer. If no pivot can be
+  derived, **refuse the scale** and count it (`pivmiss`) — never fall back to a constant or a guess.
+  `pivot_fixed` with `qx`/`qy` is a debug override only; the shipped path writes neither.
 - **Two poses per tile, and they are not interchangeable.** `base` is the resting pose and the only
   thing that may be scaled; `rp` is the replay transform used by strip-on-top and is taught from
   anything that settles while the strip is drawn. Tightening one must not blind the other: on-top
   has to work for a tile with no taught base at all.
-- Both poses are **promoted after 0.22 s with no newer write for that window**, never captured per
-  write. `base` is also the largest `m0` the tile shows (a hover lift is the smaller value), and it
-  is dropped when the strip leaves. `rp` survives a hide and refuses a candidate written before the
-  last reveal. The margins are measured: longest in-animation gap 0.13 s, post-rest silence ≥0.3 s.
+- Both poses are **promoted after 8 state documents with no newer write for that window**
+  (`SETTLE_TICKS`), never captured per write, and only while the document still says the strip is
+  drawn — re-checked at promotion. Ticks are the document's seqlock generation, not wall-clock time
+  or the payload's call rate, so load cannot shrink the window. A base candidate a newer write
+  supersedes, or one that reaches `CAND_TTL` (the wall-clock ceiling), is counted in `unsettled`.
+- `base` is also the largest `m0` the tile shows (a hover lift is the smaller value). It is dropped
+  when the strip leaves **and when the rail's app-tile id-set changes while the strip is drawn**: an
+  in-place relayout is a new drawing, and bases from the old one are stale. The key is compared
+  across state documents and adopted after two agree; WindowManager's gutter windows are excluded.
+  A change clears every base and the next settled write becomes the base. `rp` is untouched, so
+  on-top survives it.
+- `rp` survives a hide and refuses a candidate written before the last reveal. The margins are
+  measured: longest in-animation gap 0.13 s ≈ 5 documents, post-rest silence ≥0.3 s.
 - Never write a page that is not already writable, and never leave a page a branch points into
   without execute permission. Both are `KERN_PROTECTION_FAILURE` inside `WindowManager`, and the
   installer refuses rather than trying (`wmship/selftest.py` proves the guard without root).
@@ -133,11 +146,18 @@ concurrent installs invalidate each other.
   teaching off, requires every tile within 2%, then restores the caller's scale; the strip visibly
   scales for a few seconds. The app runs it when the popover opens and withholds the size slider
   until it passes; the pass path on a live armed install is still an owner check.
+- A tile with no resting base is **skipped, not a command-wide refusal**. `resize` scales the tiles
+  that have one and reports `no_base`, `scaled`, `not_scaled` and `partial`; a non-1.0 scale is
+  never `ok` when a tile was skipped. Only a pass with no strip tiles at all refuses.
 - The app's diagnostics panel, gesture resize and drop-to-tile paths are unit-tested at their pure
   seams only; none has been exercised against an armed WindowManager. Label them implemented but
   unverified.
-- The payload parses no `trace` key (#31). Do not document `cfg trace=true` as working; use
-  `wmship.sh poses` and `wmship.sh counters` for evidence.
+- `cfg trace=true` is diagnostic and **write-only**: the keeper writes one record per decision to a
+  16 KB ring, no branch reads `io_tr`, and `wmship/selftest.py` asserts that. Read it with
+  `wmship.sh trace [--reset]`; the field legend is in `docs/TECHNICAL.md`. It cannot change a
+  decision, but turn it off when the diagnosis is done. The app's **Pose trace** toggle writes
+  `trace`, and **Show trace** reads the ring; an older payload shows `unavailable`, not an empty
+  table.
 - Verify with numbers (window layers, per-tile geometry), not with screenshots of intent.
 
 ## Keeping up with macOS
@@ -153,7 +173,10 @@ When a new build appears:
    add it to `wmship/profile.json` under `<CFBundleVersion>|<sha256 of __TEXT>`.
 3. A site no longer matches → update the structural signature in `wmlocate.py`, then prove it against
    a shifted copy of the binary and a corrupted copy that must refuse.
-4. Rebuild the payload and run the four capability checks before releasing.
+4. Rebuild the payload. Before releasing, confirm `pivmiss` stays 0 and `psrc` is 1 across a resize,
+   and use `cfg trace=true` + `wmship.sh trace` to check that a hover still returns to a settled
+   value and a hide still translates without changing `m0`. If the rail yields no pivot, fix the
+   derivation; do not pin the old constant. Then run the four capability checks.
 
 `sites.json` and `profile.json` are the supported-build record. Keep both in the repo.
 
