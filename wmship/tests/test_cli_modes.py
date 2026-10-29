@@ -25,6 +25,7 @@ for _p in (_ROOT, os.path.join(_ROOT, "wmship")):
 
 import install as I            # noqa: E402
 import ctl as C                # noqa: E402
+import wmlocate as W           # noqa: E402
 
 ISLAND = 0x104000000          # within +-128 MB of the __TEXT sites, as a real island is
 SITE_ADDRS = {"birth": 0x100004000, "birth2": 0x100008000, "birthE": 0x10000C000,
@@ -41,16 +42,19 @@ def keeper_stub(addr, target):
     return I.le32(*I.jump_seq(addr, target))
 
 
-def fabricated_backup(stub_for=None):
-    """A backup.json shaped exactly like install() writes one, with each stub inside the island."""
+def fabricated_backup(stub_for=None, legacy=False):
+    """A backup.json shaped exactly like install() writes one, with each stub inside the island.
+
+    `legacy=True` renames the driver entry to the key older installs wrote (`driverE`)."""
     stub_for = stub_for or {}
     sites = {}
     for i, name in enumerate(I.SITE_NAMES):
         addr = SITE_ADDRS[name]
         target = stub_for.get(name, ISLAND + 0x100 + 0x40 * i)
         blob = keeper_stub(addr, target) if name.startswith("keeper") else near_stub(addr, target)
-        sites[name] = {"addr": addr, "orig": "00" * len(blob), "len": len(blob),
-                       "new": blob.hex(), "stub": target}
+        key = "driverE" if legacy and name == "birthE" else name
+        sites[key] = {"addr": addr, "orig": "00" * len(blob), "len": len(blob),
+                      "new": blob.hex(), "stub": target}
     return {"sites": sites}
 
 
@@ -150,6 +154,49 @@ class ArmedSites(unittest.TestCase):
         self.assertEqual([r["check"] for r in bad], ["birth2.stub-recorded"])
 
 
+class SiteNames(unittest.TestCase):
+    """#42: one canonical name table, and legacy backup keys still read as the same site."""
+
+    def test_the_canonical_names_are_the_locators_output_keys(self):
+        self.assertEqual(I.SITE_NAMES, W.SITE_NAMES)
+
+    def test_an_alias_never_shadows_another_canonical_site(self):
+        for name, aliases in I.SITE_ALIASES.items():
+            self.assertIn(name, I.SITE_NAMES)
+            for a in aliases:
+                self.assertNotIn(a, I.SITE_NAMES)
+
+    def test_a_legacy_driverE_entry_is_found_as_birthE(self):
+        bak = fabricated_backup(legacy=True)
+        self.assertIn("driverE", bak["sites"])
+        self.assertNotIn("birthE", bak["sites"])
+        self.assertIs(I.site_record(bak, "birthE"), bak["sites"]["driverE"])
+        self.assertIs(I.site_record(bak, "birth"), bak["sites"]["birth"])
+        del bak["sites"]["birth"]
+        self.assertIsNone(I.site_record(bak, "birth"))
+
+    def test_a_legacy_backup_passes_every_armed_site_check(self):
+        bak = fabricated_backup(legacy=True)
+        rows = I.armed_site_checks(bak, reader(bak), ISLAND)
+        self.assertTrue(all(r["ok"] for r in rows), [r for r in rows if not r["ok"]])
+        # the rows still name the canonical site, so a failure is actionable in today's vocabulary
+        self.assertIn("birthE.stub-bytes", [r["check"] for r in rows])
+
+    def test_a_corrupted_legacy_stub_names_the_canonical_site(self):
+        bak = fabricated_backup(legacy=True)
+        addr = SITE_ADDRS["birthE"]
+        rows = I.armed_site_checks(
+            bak, reader(bak, {addr: I.le32(I.PACIBSP, I.MOV_X1_X30, 0x94000010)}), ISLAND)
+        bad = [r for r in rows if not r["ok"]]
+        self.assertEqual([r["check"] for r in bad], ["birthE.stub-bytes"])
+
+    def test_fresh_bookkeeping_uses_the_canonical_names(self):
+        inst = {"sites": dict(SITE_ADDRS),
+                "keepers": {k: (SITE_ADDRS[k], None) for k in ("keeper3d", "keeper2d")}}
+        names = [s["name"] for s in I.site_descriptors(inst)]
+        self.assertEqual(tuple(names), I.SITE_NAMES)
+
+
 class DoctorRouting(unittest.TestCase):
     """`doctor()` end to end, armed: the mode is chosen from the state file and the report is PASS
     without ever comparing a site to the on-disk image.  A corrupted stub flips it to FAIL."""
@@ -162,7 +209,7 @@ class DoctorRouting(unittest.TestCase):
             f.write(self.disk)
         self.bak = fabricated_backup()
         self.state = {"pid": 7, "island": ISLAND, "body": 0x200000000,
-                      "syms": {"_SL": 32}, "relocs": [[32, 16]],
+                      "syms": {"_SL": 32}, "relocs": [[32, 16]], "code_len": 16,
                       "img_sha256": I.hashlib.sha256(self.disk).hexdigest()}
         self.state_path = os.path.join(self.tmp.name, "state.json")
         self.bak_path = os.path.join(self.tmp.name, "backup.json")
@@ -174,10 +221,14 @@ class DoctorRouting(unittest.TestCase):
                      "images": {"SkyLight": {"base": 0, "path": "SkyLight"}},
                      "build": "B", "text_sha": "T", "cache": "cache"}
 
-    def run_doctor(self, patches=None):
-        mem = {s["addr"]: bytes.fromhex(s["new"]) for s in self.bak["sites"].values()}
+    def run_doctor(self, patches=None, backup=None):
+        mem = {s["addr"]: bytes.fromhex(s["new"])
+               for s in (backup or self.bak)["sites"].values()}
         mem.update(patches or {})
         mem[self.state["body"]] = self.disk
+        if backup is not None:
+            with open(self.bak_path, "w") as f:
+                json.dump(backup, f)
 
         def fake_rb(addr, n):
             for base, blob in mem.items():
@@ -205,6 +256,13 @@ class DoctorRouting(unittest.TestCase):
         self.assertEqual(rep["refusals"], [])
         self.assertTrue(any(c["check"] == "payload.image" and c["ok"] for c in rep["checks"]))
 
+    def test_a_legacy_driverE_backup_passes_in_armed_mode(self):
+        rc, rep = self.run_doctor(backup=fabricated_backup(legacy=True))
+        self.assertEqual(rep["mode"], "armed")
+        self.assertTrue(rep["ok"], [c for c in rep["checks"] if not c["ok"]])
+        self.assertEqual(rc, 0)
+        self.assertEqual(rep["sites"]["birthE"]["live_va"], SITE_ADDRS["birthE"])
+
     def test_a_corrupted_stub_fails_and_names_the_site(self):
         addr = SITE_ADDRS["birth"]
         rc, rep = self.run_doctor({addr: b"\x1f\x20\x03\xd5"})
@@ -230,7 +288,10 @@ class DoctorRouting(unittest.TestCase):
 
 
 class BodyImage(unittest.TestCase):
-    """#6: the running body must be the payload image on disk, with the symbol table masked."""
+    """#42: the running body must be the payload image on disk.
+
+    The comparison is the image's r-x prefix, which install() copies verbatim and never writes
+    again; the relocated symbol table and the control buffers live in __DATA, past that prefix."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -238,26 +299,79 @@ class BodyImage(unittest.TestCase):
         self.disk = bytes(range(256)) * 4
         with open(os.path.join(self.tmp.name, "payload.img"), "wb") as f:
             f.write(self.disk)
-        self.state = {"body": 0x200000000, "img_sha256": "abc",
-                      "syms": {"_SL": 64}, "relocs": [[64, 16]]}
+        self.state = {"body": 0x200000000, "img_sha256": "abc", "code_len": 512,
+                      "syms": {"_SL": 600}, "relocs": [[600, 16]]}
 
-    def check(self, live):
+    def check(self, live, state=None):
         with mock.patch.object(I, "W", self.tmp.name), \
                 mock.patch.object(I, "img_sha256", return_value="abc"):
-            return I.body_image_check(self.state, lambda a, n: live[:n])
+            return I.body_image_check(state or self.state, lambda a, n: live[:n])
 
-    def test_the_relocated_words_do_not_count(self):
+    def test_the_relocated_symbol_table_does_not_count(self):
         live = bytearray(self.disk)
-        live[64:80] = struct.pack("<QQ", 0x1122334455667788, 0x99AABBCCDDEEFF00)
+        live[600:616] = struct.pack("<QQ", 0x1122334455667788, 0x99AABBCCDDEEFF00)
         ok, det = self.check(bytes(live))
         self.assertTrue(ok, det)
 
-    def test_a_changed_payload_byte_fails(self):
+    def test_the_config_buffer_the_install_writes_does_not_count(self):
+        """install() writes _io_cfg/_io_cfg_len into __DATA after the copy; the payload writes
+        heartbeat/log state there at runtime.  Those bytes differ on a healthy install."""
+        live = bytearray(self.disk)
+        cfg = b'{"births":true,"gen":1}'
+        live[700:760] = cfg + b"\0" * (60 - len(cfg))
+        ok, det = self.check(bytes(live))
+        self.assertTrue(ok, det)
+        self.assertIn("code[0:0x200)", det)
+
+    def test_a_changed_code_byte_fails(self):
         live = bytearray(self.disk)
         live[100] ^= 0xFF
         ok, det = self.check(bytes(live))
         self.assertFalse(ok)
         self.assertIn("not payload.img", det)
+        self.assertIn("code[0:0x200)", det)
+
+    def test_a_relocation_inside_the_compared_region_is_a_refusal_not_a_pass(self):
+        st = dict(self.state, relocs=[[64, 16]])
+        live = bytearray(self.disk)
+        live[64:80] = struct.pack("<QQ", 1, 2)
+        ok, det = self.check(bytes(live), state=st)
+        self.assertFalse(ok)
+        self.assertIn("overlaps a relocated span", det)
+
+    def test_an_older_state_derives_the_code_region_from_the_image(self):
+        big = bytes(range(256)) * 128                    # 0x8000 bytes
+        with open(os.path.join(self.tmp.name, "payload.img"), "wb") as f:
+            f.write(big)
+        with open(os.path.join(self.tmp.name, "payload.syms.json"), "w") as f:
+            json.dump({"sections": [{"name": "__TEXT,__text", "off": 0x4F0},
+                                    {"name": "__DATA,__bss", "off": 0x4000}]}, f)
+        st = {k: v for k, v in self.state.items() if k != "code_len"}
+        st["relocs"] = [[0x5000, 16]]
+        live = bytearray(big)
+        live[0x5000:0x5010] = struct.pack("<QQ", 1, 2)
+        ok, det = self.check(bytes(live), state=st)
+        self.assertTrue(ok, det)
+        self.assertIn("code[0:0x4000)", det)
+        live[100] ^= 0xFF
+        ok, det = self.check(bytes(live), state=st)
+        self.assertFalse(ok)
+
+    def test_a_state_without_a_code_region_is_a_failure_not_a_pass(self):
+        st = {k: v for k, v in self.state.items() if k != "code_len"}
+        ok, det = self.check(self.disk, state=st)
+        self.assertFalse(ok)
+        self.assertIn("code region", det)
+
+    def test_the_code_region_is_the_page_before_the_first_data_section(self):
+        self.assertEqual(I.image_code_len(
+            [{"name": "__TEXT,__text", "off": 0x4F0},
+             {"name": "__DATA_CONST,__const", "off": 0x10000},
+             {"name": "__DATA,__bss", "off": 0x14000}]), 0x10000)
+        self.assertEqual(I.image_code_len(
+            [{"name": "__TEXT,__text", "off": 0x4F0},
+             {"name": "__DATA,__bss", "off": 0x9840}]), 0x8000)
+        self.assertEqual(I.image_code_len([{"name": "__TEXT,__text", "off": 0}]), 0)
 
     def test_an_image_rebuilt_since_the_install_fails(self):
         with mock.patch.object(I, "W", self.tmp.name), \

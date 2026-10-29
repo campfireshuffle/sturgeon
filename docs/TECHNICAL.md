@@ -90,8 +90,12 @@ other (#6):
   bytes, and the object-layout profile must verify against the running process. This is the strict
   mode.
 - **`armed`** — `state.json` describes the running WindowManager, and every site holds the stub
-  bytes recorded in `backup.json`; each stub lands inside the recorded island; the running body is
-  the payload image on disk, with the relocated symbol table masked out of both digests.
+  bytes recorded in `backup.json`; each stub lands inside the recorded island; the running body's
+  r-x code region (everything before the first `__DATA` page) matches the payload image on disk by
+  sha256 (#42). That region is copied verbatim and never written again — unlike `__DATA`, which
+  install and the payload use for the config, heartbeat and log buffers — so the digest cannot
+  false-fail on a healthy install. `backup.json` entries written by older builds under the legacy
+  key `driverE` are read as `birthE`; no file is rewritten.
 
 `--mode pristine|armed|auto` selects explicitly. `auto` is the default and follows `state.json`'s
 pid. An explicit mode the state cannot support is a refusal: asking for `armed` when nothing of

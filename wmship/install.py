@@ -6,9 +6,9 @@
                                         explicit modes: a pristine WindowManager (every site still
                                         holds the on-disk image's bytes) or our own armed install
                                         (every site holds the stub recorded in backup.json, each
-                                        stub lands in the recorded island, and the running body is
-                                        the payload image on disk).  Refuses if anything is
-                                        unresolved, ambiguous or inconsistent.
+                                        stub lands in the recorded island, and the running body's
+                                        r-x code region is the payload image on disk).  Refuses if
+                                        anything is unresolved, ambiguous or inconsistent.
     pristine                             every site still holds the on-disk image's own bytes
     install                              doctor, then allocate + write + patch the six sites
     status                               build, armed/disarmed, capabilities, debugger, helper
@@ -44,6 +44,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)                   # wmlocate.py lives at <root>/
 import wmlayout as LAYOUT                       # noqa: E402
+from wmlocate import SITE_NAMES                # noqa: E402  the one canonical name table
 
 L = LAYOUT.layout()
 W = L["wmship"]
@@ -74,7 +75,11 @@ LOCK = D + "/install.lock"         # one armer at a time (see lock_install)
 # unusable for exactly the user the tool ships to).  Use a per-uid scratch directory instead.
 SCRATCH = os.path.join(tempfile.gettempdir(), "wmship-%d" % os.getuid())
 
-SITE_NAMES = ("birth", "birth2", "birthE", "compute", "keeper3d", "keeper2d")
+# backup.json keys written by installs that predate the unified names.  They are *read* as aliases
+# and never rewritten: an existing armed install must still be recognised without a migration
+# (issue #42).  The driver was recorded as `driverE` (its island stub) while the locator and the
+# doctor call it `birthE`.
+SITE_ALIASES = {"birthE": ("driverE",)}
 PACIBSP = 0xD503237F
 MOV_X1_X30 = 0xAA1E03E1          # mov x1, x30
 MOV_X30_X1 = 0xAA0103FE          # mov x30, x1
@@ -511,6 +516,20 @@ def stub_target(blob, addr):
 ISLAND_SIZE = 0x4000
 
 
+def site_record(bak, name):
+    """The backup.json record for canonical site `name`, or None.
+
+    Reads the canonical key first, then the legacy aliases.  This is the only place that knows a
+    backup key might be an older spelling; installs now write the canonical name, and a file
+    written the old way keeps working unchanged."""
+    sites = (bak or {}).get("sites") or {}
+    for key in (name,) + SITE_ALIASES.get(name, ()):
+        si = sites.get(key)
+        if si:
+            return si
+    return None
+
+
 def armed_site_checks(bak, read, island):
     """Every recorded site must still hold its stub bytes, and the stub must land in the island.
 
@@ -520,9 +539,8 @@ def armed_site_checks(bak, read, island):
     actionable failure rather than a bare count."""
     rows = []
     lo, hi = int(island), int(island) + ISLAND_SIZE
-    recorded = (bak or {}).get("sites") or {}
     for name in SITE_NAMES:
-        si = recorded.get(name)
+        si = site_record(bak, name)
         if not si:
             rows.append({"check": "%s.stub-recorded" % name, "ok": False,
                          "detail": "backup.json has no entry for %s — reinstall" % name})
@@ -560,27 +578,39 @@ def doctor_mode(requested, state, pid):
     return "armed" if state and state.get("pid") == pid else "pristine"
 
 
-def image_seal(disk, live, relocs, n):
-    """sha256 of two copies of an image with the relocated words masked out of both.
+def image_code_len(sections):
+    """Length of the image prefix that is code and read-only data: up to the first __DATA page.
 
-    The body in the process is `payload.img` with the `_SL` symbol table overwritten with this
-    process's addresses, so a plain hash of the file can never equal a hash of the running body.
-    Masking the same spans (the ones install() writes into the image before copying it) leaves a
-    digest that is comparable across processes."""
-    def masked(buf):
-        b = bytearray(bytes(buf)[:n])
-        for off, ln in relocs:
-            if off < len(b):
-                b[off:off + ln] = b"\0" * min(ln, len(b) - off)
-        return bytes(b)
-    return hashlib.sha256(masked(disk)).hexdigest(), hashlib.sha256(masked(live)).hexdigest()
+    install() copies the image into the body and afterwards writes only __DATA (the control
+    buffers: `_io_cfg`, its length and generation).  The payload writes more there at runtime
+    (heartbeat, log ring, poses), so the data half legitimately differs between the file and the
+    live process.  __TEXT is mapped r-x in the body, so no byte of this prefix can change after
+    install -- not by us, not by the payload.  Pure over the sections list, so it is unit-tested
+    without an image."""
+    offs = [int(s["off"]) for s in sections or ()
+            if str(s.get("name", "")).startswith("__DATA")]
+    return (min(offs) & ~0x3FFF) if offs else 0
+
+
+def code_digest(buf, n):
+    return hashlib.sha256(bytes(buf)[:n]).hexdigest()
 
 
 def body_image_check(st, read):
     """The body the WindowManager is running must be the payload image on disk.
 
     Two independent facts: the payload on disk is unchanged since the install (`img_sha256` in
-    state.json), and the live body matches it outside the relocated symbol table."""
+    state.json), and the live body's *code region* matches it byte for byte.
+
+    Why the code region and not a whole-image digest with the relocated symbol table masked
+    (issue #42): masking `_SL` is necessary but not sufficient.  install() then writes the config
+    buffer into the body's __DATA, and the payload writes heartbeat/log/pose state there while it
+    runs, so a whole-body digest differs on a perfectly healthy install.  The compared prefix ends
+    at the first __DATA page and is mapped r-x by install(), so it cannot be modified after the
+    copy.  A genuinely different or corrupted body therefore cannot false-pass: the whole prefix
+    (Mach-O header, __TEXT code, island image, constants, strings) is compared by sha256, and a
+    relocation that reached into it is a refusal rather than a silently masked false-pass.
+    """
     disk_sha = img_sha256()
     was = st.get("img_sha256")
     if was and disk_sha and was != disk_sha:
@@ -596,14 +626,34 @@ def body_image_check(st, read):
         body = int(st["body"])
     except Exception:
         return False, "state.json has no body/syms — reinstall"
+    # installs before the fix did not record code_len; derive it from the image's own sections
+    n = int(st.get("code_len") or 0)
+    if not n:
+        try:
+            with open(W + "/payload.syms.json") as f:
+                n = image_code_len(json.load(f).get("sections"))
+        except Exception:
+            n = 0
+    if not n:
+        return False, "cannot determine the payload's code region (state.json has no code_len)"
+    if n > len(disk):
+        return False, ("state.json's code_len %#x is past the end of payload.img (%#x bytes) — "
+                       "reinstall" % (n, len(disk)))
+    relocs = st.get("relocs") or [[syms["_SL"], 8 * 32]]
+    inside = [(off, ln) for off, ln in relocs if ln and off < n]
+    if inside:
+        return False, ("refusing to compare: code region [0,%#x) overlaps a relocated span at %#x "
+                       "— the digest would not be relocation-independent"
+                       % (n, inside[0][0]))
     live = read(body, len(disk))
     if len(live) != len(disk):
         return False, "read %d of %d body bytes at %#x" % (len(live), len(disk), body)
-    relocs = st.get("relocs") or [[syms["_SL"], 8 * 32]]
-    a, b = image_seal(disk, live, relocs, len(disk))
+    a, b = code_digest(disk, n), code_digest(live, n)
     if a == b:
-        return True, "body %#x == payload.img %s (symbol table masked)" % (body, a[:16])
-    return False, "body %#x is not payload.img: live %s, disk %s" % (body, b[:16], a[:16])
+        return True, "body %#x code[0:%#x) == payload.img %s (r-x, never rewritten)" % (body, n,
+                                                                                       a[:16])
+    return False, ("body %#x code[0:%#x) is not payload.img: live %s, disk %s"
+                   % (body, n, b[:16], a[:16]))
 
 
 def doctor(wm_binary=None, live=None, as_json=False, mode=None):
@@ -826,7 +876,7 @@ def _doctor_armed(rep, inst, f, chk, do_live, as_json):
     rep["profile"] = {"key": rep["key"], "present": bool(load_profile(rep["key"]))}
     for k in SITE_NAMES:
         fva = inst["sites"][k] if k in inst["sites"] else inst["keepers"][k][0]
-        si = (bak.get("sites") or {}).get(k) or {}
+        si = site_record(bak, k) or {}
         rep["sites"][k] = {"file_va": fva, "file_va_hex": hex(fva),
                            "live_va": si.get("addr"), "live_checked": bool(do_live)}
     if not do_live:
@@ -841,7 +891,7 @@ def _doctor_armed(rep, inst, f, chk, do_live, as_json):
     # The recorded site addresses must be the ones this build resolves to *now*: that is what ties
     # backup.json to this process, and the keeper slide is recomputed rather than trusted.
     for k in SITE_NAMES:
-        si = bak["sites"].get(k) or {}
+        si = site_record(bak, k) or {}
         want = keeper_live(k, inst) if k.startswith("keeper") else inst["sites"][k] + f["slide"]
         got = int(si.get("addr") or 0)
         chk("%s.addr-agrees" % k, got == want, "backup %#x vs resolved %#x" % (got, want))
@@ -924,6 +974,27 @@ def verify_profile(prof, do_live=True):
 
 
 # ---------------------------------------------------------------- build
+def site_descriptors(inst):
+    """The six patch descriptors, keyed by the canonical names.
+
+    This is the bookkeeping install() writes into backup.json, so it must use the same names as
+    wmlocate and the armed doctor.  `stub` is the island stub's symbol, not the site's name."""
+    return [
+        dict(name="birth",   va=inst["sites"]["birth"],   kind="bl3",      stub="_i_drv",
+             near=True),
+        dict(name="birth2",  va=inst["sites"]["birth2"],  kind="bl3",      stub="_i_drv2",
+             near=True),
+        dict(name="birthE",  va=inst["sites"]["birthE"],  kind="prologue", stub="_i_drvE",
+             near=True),
+        dict(name="compute", va=inst["sites"]["compute"], kind="ble",      stub="_i_cmp",
+             near=True),
+        dict(name="keeper3d", sym="SLSTransactionSetWindowTransform3D", kind="keeper",
+             stub="_i_k3d", near=False),
+        dict(name="keeper2d", sym="SLSTransactionSetWindowTransform",  kind="keeper",
+             stub="_i_k2d", near=False),
+    ]
+
+
 def prepare(inst=None):
     """Resolve everything, validate live, and return the six site descriptors for install()."""
     global SY, PID, DRIVER, COMPUTE_CALLEE, SITES
@@ -940,20 +1011,7 @@ def prepare(inst=None):
     if not cw or not is_bl(cw[0]):
         raise Refuse("compute site %#x is not a bl" % (inst["sites"]["compute"] + slide))
     COMPUTE_CALLEE = bl_target(cw[0], inst["sites"]["compute"] + slide) - slide
-    SITES = [
-        dict(name="birth",   va=inst["sites"]["birth"],   kind="bl3",      stub="_i_drv",
-             near=True),
-        dict(name="birth2",  va=inst["sites"]["birth2"],  kind="bl3",      stub="_i_drv2",
-             near=True),
-        dict(name="driverE", va=inst["sites"]["birthE"],  kind="prologue", stub="_i_drvE",
-             near=True),
-        dict(name="compute", va=inst["sites"]["compute"], kind="ble",      stub="_i_cmp",
-             near=True),
-        dict(name="keeper3d", sym="SLSTransactionSetWindowTransform3D", kind="keeper",
-             stub="_i_k3d", near=False),
-        dict(name="keeper2d", sym="SLSTransactionSetWindowTransform",  kind="keeper",
-             stub="_i_k2d", near=False),
-    ]
+    SITES = site_descriptors(inst)
     prof = load_profile("%s|%s" % (inst["build"], inst["text_sha"]))
     if not prof:
         raise Refuse("no WindowID layout profile for this build (see doctor)")
@@ -1331,7 +1389,7 @@ def install():
     stubs = {}
     for at, s in site_addrs:
         stub = s["stub"]
-        body_fn = {"birth": "_p_drv", "birth2": "_p_drv", "driverE": "_p_drv",
+        body_fn = {"birth": "_p_drv", "birth2": "_p_drv", "birthE": "_p_drv",
                    "compute": "_p_compute", "keeper3d": "_p_keeper",
                    "keeper2d": "_p_keeper"}[s["name"]]
         struct.pack_into("<Q", isl, syms[stub + "_body"] - island_sec["off"], body + syms[body_fn])
@@ -1412,7 +1470,7 @@ def install():
         pass
     json.dump(bak, open(BAK, "w"), indent=1)
     st = {"pid": PID, "slide": slide, "island": island, "body": body, "addr": body,
-          "size": size, "io": io, "syms": syms, "patched": done, "t": time.time(),
+          "size": size, "code_len": spl, "io": io, "syms": syms, "patched": done, "t": time.time(),
           "img_sha256": img_sha256(), "relocs": bak["relocs"],
           "build": inst["build"], "text_sha256": inst["text_sha"],
           "widmeta": prof["widmeta"], "widtable": prof["widtable"],
