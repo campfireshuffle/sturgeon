@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: wmlayout.py substitutes the python, daemon-script and runtime-log paths for the
+     location the tool runs from, so the daemon never points at a tree it does not live in.
+     `wmship.sh start` (and setup.sh) write the resolved copy to
+     /Library/LaunchDaemons/com.stagemgr.wmshipd.plist. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stagemgr.wmshipd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__WMSHIPD__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardErrorPath</key>
+    <string>__D__/daemon.err</string>
+    <key>StandardOutPath</key>
+    <string>__D__/daemon.out</string>
+</dict>
+</plist>

@@ -1,0 +1,74 @@
+# builds
+dist/
+build/
+build-*/
+*.dylib
+*.o
+*.obj
+DerivedData/
+.swiftpm/
+Package.resolved.bak
+
+# built helpers and payload image
+wmship/payload.img
+wmship/payload.dylib
+wmship/payload.c.tmp
+
+# signing material — never commit a certificate, key or profile
+*.p12
+*.p8
+*.pem
+*.key
+*.mobileprovision
+*.keychain
+*.keychain-db
+AuthKey_*
+developerID*
+*password*.txt
+
+# local state and logs
+*.log
+*.out
+*.err
+.wmtest.lock
+sites.local.json
+profile.local.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# editors / OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.idea/
+.vscode/
+*.swp
+*~
+
+# scratch
+/tmp/
+*.zip
+*.dmg
+
+# helper binaries and app bundles are built by scripts/build-helpers.sh and package.sh
+/bin/
+/wm/wmobs
+/wm/wmkey
+/wm/r20win
+/wmship/wmhb
+/wmship/wmcls
+/companion/build/
+/art/
+
+# generated cask output (the template is sturgeon.rb.in; the tap is the source of truth)
+/homebrew/Casks/sturgeon.rb
+/homebrew/Casks/sturgeon-local.rb

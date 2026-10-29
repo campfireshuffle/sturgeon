@@ -1,0 +1,24 @@
+{
+ "note": "Per-build object-layout data for the in-WM payload. These are NOT patch sites: they are the WindowID / WindowIDTable class metadata (live isa values) and the two Swift stored-property offset globals the registry diagnostic reads. Every entry is keyed by CFBundleVersion|sha256(__TEXT) and is verified against the live process by wmhb --verify before any byte is written (the helper must find WindowID objects whose isa matches, and the WM's own WindowIDTable serials must agree with them). See CONTROL.md, 'known per-build fragility'.",
+ "version": 1,
+ "builds": {
+  "462.0.8.402|2e1f8aaf0e39e9b22f31807b6637b90bd03eaba473304572383c9fd0309c2efa": {
+   "build": "462.0.8.402",
+   "text_sha256": "2e1f8aaf0e39e9b22f31807b6637b90bd03eaba473304572383c9fd0309c2efa",
+   "widmeta": 4300879208,
+   "widtable": 4300879024,
+   "ivar_reg": 4300949056,
+   "ivar_comp": 4300938872,
+   "layout": {
+    "WindowID": "isa, refcount|tag, serial@0x10, zero@0x18 (instanceSize 0x18)",
+    "WindowIDTable": "_lock@0x10, _serial@0x18, _map@0x20, _externalRepresentations@0x28",
+    "map_value": "cgWindowID u32 @0, stageID u32 @4, owner String@8, title@0x18"
+   },
+   "evidence": [
+    "widmeta 0x1005a3568: live isa of every WindowID object (round 30, 394 objects; round 31 verify: 125 objects / 117 table entries / 116 matched)",
+    "widtable 0x1005a34b0: class metadata of _TtC18WindowManagerAgentP33_7469D0DA3FE97C4A7D1D958FF9AAA3C413WindowIDTable (round 30)",
+    "ivar_reg 0x1005b4640 / ivar_comp 0x1005b1e78: the two offset globals publish_rg reads; round 31 verify reads 0x4e0 / 0x42d0"
+   ]
+  }
+ }
+}

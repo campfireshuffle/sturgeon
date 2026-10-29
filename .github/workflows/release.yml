@@ -1,0 +1,244 @@
+name: Release
+
+# Release Sturgeon: build unsigned, then (on a second job) import the Developer ID certificate,
+# sign every Mach-O inside the bundle with hardened runtime, notarize, staple, publish an immutable
+# GitHub release and bump the cask in campfireshuffle/homebrew-tap.
+#
+# This file mirrors campfireshuffle/liftoff/.github/workflows/release.yml.  It lives at the
+# repository root when this tree is published; in the development checkout it is kept at
+# work/.github/workflows/release.yml next to the tool it packages.
+#
+# Secrets (Settings → Environments → release):
+#   MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD   Developer ID Application certificate
+#   APPLE_API_PRIVATE_KEY_P8, APPLE_API_KEY_ID,
+#   APPLE_API_ISSUER_ID                                 notarytool API key
+#   HOMEBREW_TAP_DEPLOY_KEY_B64                         write access to campfireshuffle/homebrew-tap
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the v prefix
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify the requested version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if git ls-remote --exit-code --tags origin "refs/tags/v${REQUESTED_VERSION}" >/dev/null 2>&1; then
+            echo "Version v${REQUESTED_VERSION} is already published; release versions are immutable." >&2
+            exit 1
+          fi
+          echo "version=$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned app + zip the release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          SIGN_IDENTITY=- ./pack/package.sh "${{ steps.version.outputs.version }}" 35
+          # the same artifact name the cask downloads
+          ditto -c -k --keepParent art/Sturgeon.app "$RUNNER_TEMP/sturgeon-${{ steps.version.outputs.version }}-macos-arm64.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sturgeon-unsigned-${{ steps.version.outputs.version }}
+          path: ${{ runner.temp }}/sturgeon-${{ steps.version.outputs.version }}-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-and-publish:
+    needs: build
+    runs-on: macos-26
+    environment: release
+    permissions:
+      contents: write
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: sturgeon-unsigned-${{ needs.build.outputs.version }}
+          path: ${{ runner.temp }}/input
+
+      - name: Unpack the unsigned app
+        run: ditto -x -k "$RUNNER_TEMP/input/sturgeon-${VERSION}-macos-arm64.zip" "$RUNNER_TEMP/package"
+
+      - name: Import the Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          keychain="$RUNNER_TEMP/sturgeon-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$keychain_password"
+
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 -D > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 1800 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
+          [[ -n "$identity" ]]
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Sign the bundle, inside out
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/package/Sturgeon.app"
+          tree="$app/Contents/Resources/wmship"
+          entitlements="work/pack/wmx.entitlements"          # com.apple.security.cs.debugger
+          sign=(--force --sign "$SIGN_IDENTITY" --options runtime --timestamp)
+
+          # The three binaries that call task_for_pid(WindowManager) as root need the task-port
+          # entitlement under hardened runtime.  This is the only reason any helper has an
+          # entitlements file; the app shell and the observers get none.
+          for b in "$tree/bin/wmx" "$tree/wmship/wmhb" "$tree/wmship/wmcls"; do
+            codesign "${sign[@]}" --entitlements "$entitlements" "$b"
+            codesign -d --entitlements - "$b" | grep -q com.apple.security.cs.debugger
+          done
+
+          for b in "$tree"/bin/r19ax "$tree"/bin/r8state "$tree"/bin/r21probe \
+                   "$tree"/bin/r21move "$tree"/bin/r21scroll "$tree"/bin/r21gesture \
+                   "$tree"/bin/r21obs "$tree"/bin/r20click "$tree"/a/stagepilot \
+                   "$tree"/wm/wmobs "$tree"/wm/wmkey \
+                   "$app/Contents/MacOS/Sturgeon"; do
+            [[ -e "$b" ]] && codesign "${sign[@]}" "$b"
+          done
+
+          codesign "${sign[@]}" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      - name: Notarize, staple, assess, zip
+        env:
+          APPLE_API_PRIVATE_KEY_P8: ${{ secrets.APPLE_API_PRIVATE_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/package/Sturgeon.app"
+          key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          submission="$RUNNER_TEMP/sturgeon-notarization.zip"
+          archive="$RUNNER_TEMP/sturgeon-${VERSION}-macos-arm64.zip"
+
+          printf '%s' "$APPLE_API_PRIVATE_KEY_P8" | base64 -D > "$key"
+          chmod 600 "$key"
+          while IFS= read -r line; do [[ -z "$line" ]] || echo "::add-mask::$line"; done < "$key"
+
+          ditto -c -k --keepParent "$app" "$submission"
+          xcrun notarytool submit "$submission" \
+            --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          ditto -c -k --keepParent "$app" "$archive"
+          (cd "$(dirname "$archive")" && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "CHECKSUM=$archive.sha256" >> "$GITHUB_ENV"
+
+      - name: Remove Apple credentials
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "${SIGNING_KEYCHAIN:-$RUNNER_TEMP/sturgeon-signing.keychain-db}" 2>/dev/null || true
+          security list-keychains -d user -s login.keychain-db
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/sturgeon-notarization.zip"
+
+      - name: Publish an immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" "$ARCHIVE" "$CHECKSUM" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "${VERSION}" \
+            --generate-notes
+
+      - name: Bump the cask in campfireshuffle/homebrew-tap
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY_B64: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/homebrew-tap-deploy-key"
+          printf '%s' "$HOMEBREW_TAP_DEPLOY_KEY_B64" | base64 -D > "$key"
+          chmod 600 "$key"
+          mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+          cat > "$HOME/.ssh/known_hosts" <<'KEYS'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          KEYS
+
+          GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes" \
+            git clone git@github.com:campfireshuffle/homebrew-tap.git "$RUNNER_TEMP/homebrew-tap"
+
+          sha256="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+          cask="$RUNNER_TEMP/homebrew-tap/Casks/sturgeon.rb"
+          python3 - "$cask" "$VERSION" "$sha256" <<'PY'
+          import pathlib, re, sys
+          path, version, sha256 = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          if not path.exists():
+              raise SystemExit(f"missing {path}: stage Casks/sturgeon.rb in the tap first (see work/homebrew/README.md)")
+          text = path.read_text()
+          text = re.sub(r'^  version ".*"$', f'  version "{version}"', text, count=1, flags=re.MULTILINE)
+          text = re.sub(r'^  sha256 ".*"$', f'  sha256 "{sha256}"', text, count=1, flags=re.MULTILINE)
+          path.write_text(text)
+          PY
+
+          cd "$RUNNER_TEMP/homebrew-tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/sturgeon.rb
+          git commit -m "chore(cask): update Sturgeon to ${VERSION}"
+          branch="sturgeon-${VERSION}"
+          GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes" git push origin "HEAD:refs/heads/${branch}"
+          {
+            echo "### Homebrew cask update"
+            echo "Open and merge the protected tap pull request:"
+            echo "https://github.com/campfireshuffle/homebrew-tap/compare/main...${branch}?expand=1"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove Homebrew credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/homebrew-tap" "$RUNNER_TEMP/homebrew-tap-deploy-key" "$HOME/.ssh/known_hosts"

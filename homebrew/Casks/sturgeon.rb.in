@@ -1,0 +1,57 @@
+cask "sturgeon" do
+  version "@@VERSION@@"
+  sha256 "@@SHA256@@"
+
+  url "@@URL@@"
+  name "Sturgeon"
+  desc "Stage Manager capabilities (birth placement, move, on-top, resize) via an in-memory WindowManager patch"
+  homepage "https://github.com/campfireshuffle/sturgeon"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on arch: :arm64
+  depends_on macos: :sonoma
+
+  app "Sturgeon.app"
+
+  # First run is a GUI flow on purpose: the app's Set Up button runs the bundled setup.sh through
+  # `osascript … with administrator privileges`, so the one privileged step needs no terminal.
+  caveats <<~EOS
+    Sturgeon patches WindowManager in memory.  To start:
+
+      1. open Sturgeon (menu-bar icon) and press Set Up     # one administrator approval
+      2. press Start
+
+    The same two steps from a shell, if you prefer:
+
+      sudo #{appdir}/Sturgeon.app/Contents/Resources/wmship/setup.sh
+      #{appdir}/Sturgeon.app/Contents/Resources/wmship/wmship.sh doctor && … start
+
+    Requirements: SIP disabled (`csrutil status`), macOS 26 or later, Xcode command line tools
+    for /usr/bin/python3, and an admin account.  setup.sh writes one NOPASSWD rule for the
+    bundled bin/asroot and the com.stagemgr.wmshipd LaunchDaemon, both derived from this app's
+    own path; it is idempotent and refuses to grant any other copy.
+
+    `brew uninstall --cask sturgeon` boots the LaunchDaemon out and removes the sudoers rule;
+    `brew uninstall --zap --cask sturgeon` also removes ~/Library/Application Support/Sturgeon
+    and /tmp/wmship.  Quit the menu-bar app first (it is an LSUIElement app).
+  EOS
+
+  # The privileged undo is one bundled script, deliberately: it must run as root, BEFORE the app is
+  # deleted, and it uses the tool's own NOPASSWD helper so `brew uninstall` needs no password.
+  uninstall script: {
+              executable:   "#{appdir}/Sturgeon.app/Contents/Resources/wmship/teardown.sh",
+              must_succeed: false,
+              print_stdout: true,
+            }
+
+  # Zap removes the user state.  /tmp/wmship is ALSO gone after `brew uninstall --zap` -- the
+  # uninstall script above runs first (uninstall stanzas always run for --zap) and removes it as
+  # root through the bundled NOPASSWD helper.  It is deliberately not repeated as a zap `delete:`,
+  # because Homebrew deletes paths outside the home directory with sudo and would prompt for a
+  # password even though the path is already gone.
+  zap trash: "~/Library/Application Support/Sturgeon"
+end

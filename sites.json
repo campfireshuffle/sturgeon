@@ -1,0 +1,80 @@
+{
+ "images": {
+  "SkyLight": {
+   "builds": {
+    "c284a291b68b3d0da1a03f866f87efdc|342afc6cfbd59fd52405601f8e6db1ac37146919fb023b193fd80b051fff8041": {
+     "build": "c284a291b68b3d0da1a03f866f87efdc",
+     "cache_uuid": "c284a291b68b3d0da1a03f866f87efdc",
+     "evidence": {
+      "keeper2d": [
+       "export trie: _SLSTransactionSetWindowTransform at image+0xa7b48 -> 0x18713ab48",
+       "prologue `pacibsp ; sub sp,#0x80 ; stp d9,d8,[sp,#0x30]`",
+       "entry is an LC_FUNCTION_STARTS entry",
+       "sibling prologue class shared with keeper3d"
+      ],
+      "keeper3d": [
+       "export trie: _SLSTransactionSetWindowTransform3D at image+0xa8010 -> 0x18713b010",
+       "prologue `pacibsp ; sub sp,#0x70 ; stp d9,d8,[sp,#0x30]`",
+       "entry is an LC_FUNCTION_STARTS entry",
+       "sibling prologue class shared with keeper2d"
+      ]
+     },
+     "image_base": 6560493568,
+     "sites": {
+      "keeper2d": 6561180488,
+      "keeper3d": 6561181712
+     },
+     "text_hi": 6566142784,
+     "text_lo": 6560504792,
+     "text_sha256": "342afc6cfbd59fd52405601f8e6db1ac37146919fb023b193fd80b051fff8041",
+     "ts": 1793226257
+    }
+   }
+  },
+  "WindowManager": {
+   "builds": {
+    "462.0.8.402|2e1f8aaf0e39e9b22f31807b6637b90bd03eaba473304572383c9fd0309c2efa": {
+     "build": "462.0.8.402",
+     "evidence": {
+      "birth": [
+       "`bl driver` at 0x1002ac2ac (VA order: higher of the two)",
+       "the call after it is `bl 0x100220bf8`, identical at both birth sites",
+       "site lies in function 0x1002a9468 (24716 bytes), innermost loop span 0x3bc4 bytes",
+       "driver has exactly 2 callers, both patched"
+      ],
+      "birth2": [
+       "`bl driver` at 0x10029c1a8 (VA order: lower of the two)",
+       "the call after it is `bl 0x100220bf8`, identical at both birth sites",
+       "site lies in function 0x10029be20 (2684 bytes)"
+      ],
+      "birthE": [
+       "`bl` target 0x1002a6970: prologue `pacibsp ; mov x1,x30 ; bl ; mov x30,x1`",
+       "body calls compute 0x100268598",
+       "exactly 2 `bl` callers in __TEXT",
+       "prologue call 0x100013eb8 (signed-return helper)"
+      ],
+      "compute": [
+       "unique `bl ; mov x19,x0 ; sub x8,x29,#0x100` at 0x1002a6f3c",
+       "callee 0x100268598 starts with pacibsp",
+       "callee is an LC_FUNCTION_STARTS entry",
+       "callee prologue `pacibsp ; sub sp,#0x120`"
+      ]
+     },
+     "extra": {
+      "compute_callee": 4297491864,
+      "driver": 4297746800
+     },
+     "sites": {
+      "birth": 4297769644,
+      "birth2": 4297703848,
+      "birthE": 4297746800,
+      "compute": 4297748284
+     },
+     "text_sha256": "2e1f8aaf0e39e9b22f31807b6637b90bd03eaba473304572383c9fd0309c2efa",
+     "ts": 1793226252
+    }
+   }
+  }
+ },
+ "version": 2
+}
