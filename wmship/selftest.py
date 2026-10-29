@@ -319,6 +319,11 @@ def test_payload_invariants():
           '"qx"' not in ins.split("CFG_DEFAULT")[1].split("}")[0])
     ctl = open(os.path.join(HERE, "ctl.py")).read()
     check("ctl.py writes no pivot", "qx=16" not in ctl and "490" not in ctl)
+    wmc = os.path.join(HERE, "..", "wm", "wmctl.py")
+    if os.path.exists(wmc):
+        sweep = open(wmc).read().split("def force_writes")[1].split("\ndef ")[0]
+        check("the teach sweep parks in the gutter, never on a tile (Orca 9547 regression)",
+              "30 400" not in sweep and "3 500 3 500" in sweep)
     ars = os.path.join(HERE, "..", "helpers", "asroot.c")
     check("the trace verb exists in every layer",
           "def trace_dump" in ctl

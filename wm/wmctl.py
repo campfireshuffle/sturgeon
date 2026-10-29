@@ -376,9 +376,16 @@ def force_writes(passes=2):
         # Park the pointer in the gutter margin, not in the middle of the screen: the strip
         # retracts within ~0.4 s of the pointer leaving the left edge, and every caller measures
         # right after a sweep (0.35 s).  x = 3 is left of the first tile, so it keeps the strip
-        # drawn without hovering any tile.  Leaving it at 700,500 made the measurement a race and
-        # dropped every base on the way out (issue #4 trial, round 3).
-        sh("%s 30 400 3 500 20" % MOVE)
+        # drawn without hovering any tile.
+        #
+        # The stream must *start* in the gutter too (it begins by teleporting to (x1,y1)).  It
+        # used to start at (30,400), which is inside a tile whenever one is drawn across y=400:
+        # that re-hovered that tile after every real tile had been visited, so its unhover burst
+        # was the newest candidate in the keeper and the last pose activity of the sweep -- and a
+        # candidate needs a *later* keeper call to be promoted (regression: Orca, tile 9547, on
+        # the owner's strip, where (30,400) sits inside it).  Parking from the gutter leaves the
+        # sweep's last real visit as its final burst, and `ctl.wait_bases` supplies the call.
+        sh("%s 3 500 3 500 2" % MOVE)
         time.sleep(0.4)
     return n
 
