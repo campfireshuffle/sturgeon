@@ -10,7 +10,8 @@
 #   wmship doctor             resolve + validate all six sites and the object-layout profile
 #   wmship uninstall          stop, then remove the LaunchDaemon and every temp artefact
 #
-#   extras: wmship level 0|3 | warm | measure | cfg | log [-f] | pristine | restart
+#   extras: wmship level 0|3 | warm | measure | teach | selfcheck | cfg | log [-f] | pristine |
+#           restart
 #
 # The only persistent root process is /Library/LaunchDaemons/com.stagemgr.wmshipd.plist
 # (wmshipd.py), and only while the patch is *armed*: `stop`/`uninstall` boot it out.  It exists
@@ -58,7 +59,7 @@ pyroot() {
 # /tmp/wmship is the helper's state directory.  Read-only commands must not create it (a user-run
 # `status` used to recreate it as an empty user-owned directory after `uninstall` had removed it).
 case "${1:-status}" in
-  status|doctor|pristine|log) : ;;
+  status|doctor|pristine|log|selfcheck) : ;;
   *) mkdir -p $D; chmod 777 $D 2>/dev/null ;;
 esac
 
@@ -109,9 +110,10 @@ daemon_unload() {
 case "${1:-status}" in
   start)
     need_root; debugger_guard
-    # Idempotent: already armed from this exact payload image is a no-op.  Doctor validates a
-    # *pristine* WindowManager by design, so running it against our own live patch used to refuse
-    # a perfectly good install and made `start` fail the second time (round 34).
+    # Idempotent: already armed from this exact payload image is a no-op.  `doctor` can validate an
+    # armed install too (`--mode armed`, chosen automatically), but re-arming from an armed state
+    # is not what this branch is for: it keeps `start` from restoring a payload that is already
+    # resident (round 34).
     SAME=$($PY - "$D/state.json" "$S/payload.img" <<'PYEOF'
 import hashlib, json, sys
 try:
@@ -183,7 +185,15 @@ PYEOF
     ;;
   resize)
     need_root; shift
-    pyroot ctl.py resize "${1:-1.0}"
+    pyroot ctl.py resize "${1:-1.0}" "${@:2}"
+    ;;
+  teach)
+    need_root; shift
+    pyroot ctl.py teach
+    ;;
+  selfcheck)
+    need_root
+    pyroot ctl.py selfcheck
     ;;
   level)
     need_root; shift
@@ -216,6 +226,6 @@ PYEOF
     ;;
   *)
     echo "usage: wmship start|stop|status|move <stage>|resize <scale>|doctor|uninstall"
-    echo "       extras: restart|level 0|3|warm|measure|state|cfg|log [-f]|pristine"
+    echo "       extras: restart|level 0|3|warm|measure|state|cfg|log [-f]|pristine|teach|selfcheck"
     exit 1 ;;
 esac

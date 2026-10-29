@@ -5,7 +5,9 @@ Everything here goes through the *payload's own page* (via install.py) or throug
 observers that only read CGWindowList / AX.  No debugger, no task port for the read side.
 
   ctl.py move <stage|current|#cgid> [--cgid N]   switch to the stage, then move a window into it
-  ctl.py resize <scale>                          strip rendered scale 0.4 .. 1.5 (1.0 = natural)
+  ctl.py resize <scale> [--teach]                strip rendered scale 0.4 .. 1.5 (1.0 = natural)
+  ctl.py teach                                   re-learn every tile's resting pose, now
+  ctl.py selfcheck                               is the teach state good enough to offer resize?
   ctl.py level <0|3>                             raise/lower the strip windows via the keeper
   ctl.py measure                                 tiles + live windows as JSON
   ctl.py state                                   the state document the payload received
@@ -29,6 +31,14 @@ import install as I                                        # noqa: E402
 D = I.D
 NATURAL = D + "/natural.json"
 LAST_RESIZE = D + "/last_resize.json"
+
+# One teach pass is a sweep over every tile plus the settle the payload's gate needs before it
+# will learn: the expensive half of a resize.  It happens only when the layout is not known yet.
+TEACH_SETTLE = 1.2
+FAST_TRIES = 2           # bases present and fresh: apply, then re-sweep only if a tile missed
+SLOW_TRIES = 4           # the old budget, kept for the path that just re-learned the layout
+SELFCHECK_TOL = 0.02     # issue #5: a tile more than 2% off the expected scale is a refusal
+PROBE_S = 1.2            # the scale selfcheck applies to make a wrong base visible
 
 
 def wmctl():
@@ -130,13 +140,62 @@ def rail_tiles():
 
 def natural():
     try:
-        return json.load(open(NATURAL))
+        with open(NATURAL) as f:
+            d = json.load(f)
     except Exception:
         return {}
+    return {str(k): v for k, v in (d or {}).items() if isinstance(v, (int, float))}
+
+
+# ---------------------------------------------------------------- teach (issue #17)
+def teach_reason(tiles, nat, rows):
+    """Why a teach pass is required before a resize can be trusted, or None when it is not.
+
+    The three reasons the old code taught unconditionally on every resize are all observable:
+    a rail tile with no taught base (the payload publishes `hasbase` per pose), and a tile set the
+    natural-width record has never seen (the strip re-lays out when the set changes, so widths are
+    keyed by window id).  When neither holds, the bases are for this layout and can be reused."""
+    ids = [str(t["id"]) for t in tiles]
+    if not ids:
+        return "no strip tiles on screen"
+    if set(ids) != set(nat):
+        return "tile set changed (%d live, %d in the natural record)" % (len(ids), len(nat))
+    have = {int(r["wid"]) for r in rows if r.get("base")}
+    nobase = [int(i) for i in ids if int(i) not in have]
+    if nobase:
+        return ("%d tile(s) have no taught base: %s"
+                % (len(nobase), ", ".join(str(x) for x in nobase)))
+    return None
+
+
+def teach_now(M=None, settle=TEACH_SETTLE):
+    """One teach pass: re-learn every rail tile's resting pose and re-record the natural widths
+    that go with it.
+
+    Teaching is only allowed at scale 1.0 (the payload gates on it, because a base learned at any
+    other scale bakes that scale in), so this releases any applied scale first and leaves the
+    strip at 1.0; the caller applies the scale it wants afterwards.  Teaching is switched off again
+    before returning: a later sweep must not learn from a hover lift (round 34)."""
+    M = M or wmctl()
+    t0 = time.time()
+    cfg_set(s=1.0, dilate=False, teach=True)
+    moves = M.force_writes()
+    time.sleep(settle)
+    tiles = rail_tiles()
+    nat = {str(t["id"]): t["w"] for t in tiles}
+    if nat:
+        with open(NATURAL, "w") as f:
+            json.dump(nat, f, indent=1)
+    cfg_set(teach=False)
+    have = {int(r["wid"]) for r in poses() if r.get("base")}
+    nobase = [int(i) for i in nat if int(i) not in have]
+    return {"ok": bool(nat) and not nobase, "moves": moves, "tiles": len(nat),
+            "bases": len(nat) - len(nobase), "no_base": nobase,
+            "secs": round(time.time() - t0, 2)}
 
 
 # ---------------------------------------------------------------- resize
-def apply_scale(s, tries=4):
+def apply_scale(s, tries=None, teach=False):
     """Scale the strip and verify it per tile against each tile's natural width.  The keeper
     applies the scale on every WM pose write, so a tile the WM has not re-emitted yet is caught
     by the next sweep (each sweep is a hover over every tile: user-side mouse moves only).
@@ -144,28 +203,43 @@ def apply_scale(s, tries=4):
     The natural-width record is keyed by window id, so a change in the stage set (a stage switch,
     a window closing) used to leave stale entries behind and report `ok: false` while the
     geometry was right (round 32, reporting defect).  It is now refreshed whenever the set of
-    tiles differs from the record."""
+    tiles differs from the record.
+
+    Issue #17: a full teach pass is the expensive half of a resize, and it is needed only when the
+    layout is not already known -- a tile with no base, or a tile set the record has not seen.
+    Otherwise the bases are reused and this command only does its measurement sweep.  `teach=True`
+    forces the pass (the `resize --teach` / `teach` verbs)."""
     M = wmctl()
     s = round(float(s), 3)
-    nat = natural()
-    live = {str(t["id"]): t["w"] for t in rail_tiles()}
-    if not live:
+    t0 = time.time()
+    tiles = rail_tiles()
+    if not tiles:
         return {"s": s, "ok": False, "err": "no strip tiles on screen (reveal the strip first)",
                 "tiles": []}
-    if set(live) != set(nat):
-        cfg_set(s=1.0, dilate=False, teach=False)
-        M.force_writes()
-        time.sleep(0.45)
-        nat = {str(t["id"]): t["w"] for t in rail_tiles()}
-        json.dump(nat, open(NATURAL, "w"), indent=1)
+    nat = natural()
+    why = "requested" if teach else teach_reason(tiles, nat, poses())
+    taught = None
+    if why:
+        taught = teach_now(M)
+        if not taught["ok"]:
+            cfg_set(teach=True)
+            return {"s": s, "ok": False, "tiles": [], "teach": taught,
+                    "err": "teach pass did not produce a base for %d tile(s): %s"
+                           % (len(taught["no_base"]),
+                              ", ".join(str(x) for x in taught["no_base"]) or "no rail tiles")}
+        nat = natural()
+    if tries is None:
+        tries = SLOW_TRIES if why else FAST_TRIES
     # Teaching is off while this command sweeps (round 34): a hover *lift* is a transient pose the
     # WM restores from its own copy without going through the keeper hook, so a base learned from a
     # lift renders `1.5 x lift` (measured 1.505-1.746).  The base is taught by the strip's own
     # reveal/layout writes, before any pointer input.
     c = cfg_set(s=s, dilate=abs(s - 1.0) > 1e-9, qx=16.0, qy=490.0, teach=False)
-    rep = {"s": s, "gen": c["gen"], "tries": 0, "tiles": [], "ok": False}
+    rep = {"s": s, "gen": c["gen"], "tries": 0, "tiles": [], "ok": False,
+           "teach": {"needed": bool(why), "reason": why, "passes": 1 if why else 0,
+                     "secs": (taught or {}).get("secs", 0.0)}}
     for i in range(tries):
-        M.force_writes()
+        M.force_writes(passes=1)     # measurement only: every tile written once (see wmctl.py)
         time.sleep(0.35)
         rep["tries"] = i + 1
         rep["tiles"] = [{"id": t["id"], "owner": t["owner"], "w": t["w"],
@@ -179,7 +253,99 @@ def apply_scale(s, tries=4):
             break
     cfg_set(teach=True)          # the next layout write may teach the resting pose again
     rep["hb"] = {k: hb().get(k) for k in ("strip", "apply", "dil")}
-    json.dump(rep, open(LAST_RESIZE, "w"), indent=1)
+    rep["secs"] = round(time.time() - t0, 2)
+    with open(LAST_RESIZE, "w") as f:
+        json.dump(rep, f, indent=1)
+    return rep
+
+
+# ---------------------------------------------------------------- selfcheck (issue #5)
+def selfcheck(measure=None, nat=None, s=None, tol=SELFCHECK_TOL, probe=PROBE_S,
+              apply=None, sweep=None, settle=None):
+    """The resize preflight: does every tile scale by the factor the keeper thinks it applied?
+
+    Measuring at rest is not a check.  At `s == 1.0` the keeper writes a base back to the screen
+    only when the WM's write is our own, and `apply_all()` runs only on a keeper call -- so a base
+    taught 5% too large from a hover lift is *invisible* while the strip is at rest: the WM draws
+    its own resting pose and `width / natural` reads 1.000 whether the base is right or not.  That
+    is exactly the state in which the app offers the slider, so a rest measurement would pass every
+    broken install and the first scale would land ~5% off.
+
+    So the probe is: apply a known scale with teaching off, let the keeper compose
+    `mat_scale(base, probe)` onto the tiles, and demand the drawn width back as `probe x natural`
+    within `tol`.  A base that is wrong by 5% reads `probe x 1.05` and fails.  Then the caller's
+    scale is restored and the geometry is measured again, so the check cannot leave the strip
+    somewhere it was not (and cannot leave a scale applied).
+
+    `apply_all()` is called from `keeper_body` only (wmship/payload.c), i.e. only when the WM emits
+    a pose write; a cfg generation change on its own does not repaint.  Each phase therefore needs
+    one write-triggering sweep, which is one pointer pass over the tiles and the same cost as a
+    resize measurement sweep.  Teaching stays off for the whole probe.
+
+    `measure`, `apply` and `settle` are the seam: tests drive a fake strip through them, so the
+    whole decision (including the doctored-base case) is exercised without a WindowManager."""
+    measure = measure or rail_tiles
+    apply = apply or (lambda **kw: cfg_set(**kw))
+    sweep = sweep or (lambda: wmctl().force_writes(passes=1))
+    settle = settle or (lambda secs=0.35: time.sleep(secs))
+
+    def rows(want):
+        out = []
+        for t in measure():
+            n = nat.get(str(t["id"]))
+            out.append({"id": t["id"], "owner": t.get("owner"), "w": t["w"], "natural": n,
+                        "ratio": round(t["w"] / n, 3) if n else None, "want": want})
+        return out
+
+    def off(rs, want):
+        return [r for r in rs if r["ratio"] is None or abs(r["ratio"] - want) > tol + 1e-9]
+
+    t0 = time.time()
+    if s is None:
+        c = cfg_get()
+        s = float(c.get("s", 1.0)) if c.get("dilate") else 1.0
+    s = round(float(s), 3)
+    if nat is None:
+        nat = natural()
+    rep = {"ok": False, "s": s, "probe_s": probe, "tol": tol, "tiles": [],
+           "restored": [], "err": None}
+    first = measure()
+    if not first:
+        rep["err"] = "no strip tiles on screen (reveal the strip first)"
+        return rep
+    missing = [t["id"] for t in first if not nat.get(str(t["id"]))]
+    if missing:
+        rep["err"] = ("no natural width on record for tile(s) %s — run: wmship.sh teach"
+                      % ", ".join(str(x) for x in missing))
+        return rep
+
+    err = None
+    try:
+        apply(s=probe, dilate=True, teach=False)
+        sweep()
+        settle()
+        rep["tiles"] = rows(probe)
+        bad = off(rep["tiles"], probe)
+        if bad:
+            worst = max(bad, key=lambda r: abs((r["ratio"] or 0) - probe))
+            err = ("tile %s measures %s x natural at probe %.2f, want %.2f ± %.2f (%d of %d off)"
+                   % (worst["id"],
+                      "%.3f" % worst["ratio"] if worst["ratio"] is not None else "unknown",
+                      probe, probe, tol, len(bad), len(rep["tiles"])))
+    finally:
+        # whatever happened, put the strip back where it was found
+        apply(s=s, dilate=abs(s - 1.0) > 1e-9, teach=True)
+        sweep()
+        settle()
+        rep["restored"] = rows(s)
+        if err is None:
+            rbad = off(rep["restored"], s)
+            if rbad:
+                err = ("strip did not return to %.3f: tile %s reads %s"
+                       % (s, rbad[0]["id"], rbad[0]["ratio"]))
+    rep["ok"] = err is None
+    rep["err"] = err
+    rep["secs"] = round(time.time() - t0, 2)
     return rep
 
 
@@ -290,7 +456,23 @@ if __name__ == "__main__":
         print('{"ok": false, "err": "not installed (run ./wmship.sh start)"}')
         raise SystemExit(1)
     if cmd == "resize":
-        r = apply_scale(a[0]); print(json.dumps(r, indent=1)); sys.exit(0 if r["ok"] else 1)
+        rest = [x for x in a if not x.startswith("-")]
+        r = apply_scale(rest[0] if rest else 1.0, teach="--teach" in a)
+        print(json.dumps(r, indent=1)); sys.exit(0 if r["ok"] else 1)
+    elif cmd == "teach":
+        r = teach_now()
+        cfg_set(teach=True)              # leave the payload able to learn the next layout
+        r["s"] = 1.0                     # teaching is only allowed at 1.0, so it released any scale
+        print(json.dumps(r, indent=1))
+        print("teach: strip left at scale 1.0 — re-apply a scale with `wmship.sh resize <s>`")
+        sys.exit(0 if r["ok"] else 1)
+    elif cmd == "selfcheck":
+        r = selfcheck()
+        print(json.dumps(r, indent=1))
+        if not r["ok"]:
+            print("selfcheck: resize unavailable — %s" % r["err"], file=sys.stderr)
+            I.log("selfcheck: %s" % r["err"])       # the app shows it; the log keeps it
+        sys.exit(0 if r["ok"] else 1)
     elif cmd == "move":
         cg = 0
         if "--cgid" in a:
@@ -313,4 +495,4 @@ if __name__ == "__main__":
     elif cmd == "cfg":
         print(json.dumps(cfg_get(), indent=1))
     else:
-        raise SystemExit("usage: ctl.py move|resize|level|measure|warm|cfg")
+        raise SystemExit("usage: ctl.py move|resize|teach|selfcheck|level|measure|warm|cfg")

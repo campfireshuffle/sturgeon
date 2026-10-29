@@ -170,8 +170,12 @@ def main():
             continue
         if pid != applied:
             # never patch blind: doctor resolves and validates every site, and verifies the
-            # object-layout profile against this very process, before anything is written
-            rc, out, err = run([INSTALL, "doctor", "--json"], 300)
+            # object-layout profile against this very process, before anything is written.
+            # `--mode pristine` is explicit: this gate runs because the WindowManager is *new*
+            # (pid != the installed pid), so the sites must be the shipped image's own bytes.
+            # Auto-selection would give the same answer today; pinning it keeps the daemon's
+            # refusal semantics from drifting if an install ever survives a pid change.
+            rc, out, err = run([INSTALL, "doctor", "--json", "--mode", "pristine"], 300)
             if rc != 0:
                 fails += 1
                 try:
