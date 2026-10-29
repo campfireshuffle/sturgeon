@@ -24,12 +24,12 @@ Observer (`/tmp/wm/obs.log`), trial for `birth-sameapp3.txt`:
 ```
 
 That is issue #36's signature exactly (the issue measured `48,713 96×117`). Counters after the
-trial: `inject=0`, so the window stayed in TextEdit's offscreen stage. Repeated with TextEdit
+trial: `place=0`, so the window stayed in TextEdit's offscreen stage. Repeated with TextEdit
 having *no document windows at all* (its stage removed from the strip): same result, a tile at
 `16,708 98×117`.
 
 When TextEdit was the current app instead, a new document joined the current stage by itself
-(`FULL`, 254,105 665×433) with one driver call and no injection. The failure is therefore specific
+(`FULL`, 254,105 665×433) with one driver call and no placements. The failure is therefore specific
 to the app not being the current stage — which is the case Sturgeon exists for.
 
 ## Why the current hook cannot see it
@@ -41,7 +41,7 @@ either birth site**. The placement driver itself *was* entered — `drv` grew by
 the birth branch ran — but only through its entry (`driverE`), i.e. from a caller that is not one
 of the two patched `bl` sites, and always with an **empty** transient-operation array.
 
-So the payload gets the birth branch at the right moments, and the branch does what it is designed
+So the component gets the birth branch at the right moments, and the branch does what it is designed
 to do: it calls `identify()`, which defers because no young `CGWindowID` has been published yet
 (`pdwait` 26 in one trial), then misses. The window server lists the new window tens of
 milliseconds later; by then nothing calls the driver again. This is the measured cause, confirmed
@@ -52,7 +52,7 @@ Two identity alternatives were tested at that entry and both fail:
 * **The WM model (`x20`, `io_wids` census).** Scanning the model for WindowIDs the census can
   confirm, with a rendezvous at the call, found either nothing (`mn = 0`, 2 rendezvous in the
   trial) or an unrelated window. In one explicit A/B it picked the current front window (Ghostty,
-  serial 102) and injected it into the current stage — a wrong-window injection that happened to
+  serial 102) and placed it into the current stage — a wrong-window placements that happened to
   be a no-op because the target was already there. It is not a newborn identity.
 * **The CGWindowID path.** `fresh_candidate()`/`io_pd` is the window server's list, which is the
   thing that lags. No rearrangement of that data can make it hold a window it has not listed.
@@ -99,7 +99,7 @@ increments `_serial` and rewrites `_map`. It records the stage value but does no
 ## Anchor B
 
 `SLSRegisterNotifyProc`-class notification was not measured. Even if it fires for a same-app
-window, it only supplies an event; the payload would still need to perform the assignment, and the
+window, it only supplies an event; the component would still need to perform the assignment, and the
 only assignment paths found are the component's modify path above or the placement driver, which
 does not run after the window is visible. It is a source of *timing*, not of *action*, so it is not
 a substitute for anchor A — at best it bounds when to try.

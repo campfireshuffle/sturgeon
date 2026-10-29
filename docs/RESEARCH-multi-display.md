@@ -68,7 +68,7 @@ it is partial and stale. To this code, a window moved to another Space is simply
 longer in the current stage's set and no longer in the rail. Whether the pose table then drops it or
 keeps replaying a pose for a window that is not on screen is unverified; §3.5 asks for it.
 
-The state document is the only channel between the observer and the payload, and its shape is fixed:
+The state document is the only channel between the observer and the component, and its shape is fixed:
 
 | field | meaning on one display | what it would mean with two |
 |---|---|---|
@@ -80,7 +80,7 @@ The state document is the only channel between the observer and the payload, and
 | `strip_ids` | union of rail ids over the last 10 s | union over both strips |
 | `t` | observation time | unchanged |
 
-The payload mirrors what it received into its heartbeat: `stx` (min x over `rail_now`), `fx`, `ston`,
+The component mirrors what it received into its heartbeat: `stx` (min x over `rail_now`), `fx`, `ston`,
 `strail`, `stflush`, `stok`, `stgood`, `stbad`, `stbusy`, `stlen`, `stms`. Those are the fields a
 measurement has to quote, because they show what the keeper actually acted on rather than what the
 observer wrote.
@@ -88,7 +88,7 @@ observer wrote.
 ## 3. Measurements to take on a second display
 
 The state document only exists while the patch is installed, so this procedure requires arming. That is
-the payload stream's job, under its lock and its one-arm-at-a-time rule; it must not be run by any other
+the component stream's job, under its lock and its one-arm-at-a-time rule; it must not be run by any other
 stream. The configuration survey and the accessibility dump below need no patch and can be done by
 anyone.
 
@@ -104,7 +104,7 @@ main, and whether "Displays have separate Spaces" is on. Then, armed:
 
 ```sh
 ./wmship.sh status                        # armed, capabilities, processes
-wmship/ctl.py state                       # the document as the payload received it
+wmship/ctl.py state                       # the document as the component received it
 wmship/ctl.py measure                     # tiles, live ids, helper counters
 wmship/ctl.py poses                       # per window: base taught? own write? level?
 wmship/ctl.py cfg                         # s, qx, qy, enabled keys
@@ -112,9 +112,9 @@ cat /tmp/wm/state.json                    # the observer's own document, before 
 ```
 
 There are three layers and they disagree in useful ways: the observer's file (`/tmp/wm/state.json`), the
-copy in the payload page (`ctl.py state`, which reports length, generation and completeness), and the
-payload's gate values (`ctl.py measure` → `hb`, and `wmship.sh status`). A measurement that quotes only
-one of them cannot distinguish "the observer never saw the strip" from "the payload rejected the
+copy in the component page (`ctl.py state`, which reports length, generation and completeness), and the
+component's gate values (`ctl.py measure` → `hb`, and `wmship.sh status`). A measurement that quotes only
+one of them cannot distinguish "the observer never saw the strip" from "the component rejected the
 document" from "the keeper decided not to act".
 
 ### 3.1 Configuration and geometry
@@ -215,7 +215,7 @@ Rows are configurations. Columns are the checks. Fill each cell with the observe
 | Stage Manager off then on while armed | | | | | | | | | |
 
 `n/a` and `–` mean the question does not arise; blank means not yet measured. A row is only complete
-when the observer document, the payload's copy and the payload's gate values were all recorded for it.
+when the observer document, the component's copy and the component's gate values were all recorded for it.
 
 ## 5. What the code would need if the tiles are per display
 

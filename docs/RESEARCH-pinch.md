@@ -26,7 +26,7 @@ the hard part is not doing anything with a pinch, it is receiving one.
 | question | result | basis |
 |---|---|---|
 | Is there a public way for a third-party process to create a magnification event? | No. IOKit on this build does not export `IOHIDEventCreateMagnificationEvent`. | symbol check on macOS 27.0.1 / 26A434, repeated for this note; see §2.1 |
-| Can a generic HID scale event be constructed and dispatched instead? | Constructed: yes (`IOHIDEventCreateScaleEvent` is exported). Dispatched: refused, `0x540000` as root and `0x5040000` as an ordinary user, with no magnify `NSEvent` produced. | recorded during the original work; the same build family, not re-run here because dispatching injects input into the session |
+| Can a generic HID scale event be constructed and dispatched instead? | Constructed: yes (`IOHIDEventCreateScaleEvent` is exported). Dispatched: refused, `0x540000` as root and `0x5040000` as an ordinary user, with no magnify `NSEvent` produced. | recorded during the original work; the same build family, not re-run here because dispatching sends a synthetic input event into the session |
 | Does the strip accept any gesture? | No. It advertises no resize accessibility action and no drag handle, and its width is derived from tile content (150–255 points), not set by the user. Five phase-tagged gesture posts over the strip changed tile or strip geometry 0 times. | recorded during the original work |
 | Can an app observe a pinch? | Not established. A global `NSEvent` monitor for `.magnify` installs and would receive it, but it was never fed a real pinch: automation cannot perform a physical gesture. | `helpers/r21gesture.swift`; never exercised |
 
@@ -111,8 +111,8 @@ What would have to be true: gesture events pass through a layer an ordinary proc
 consume, and the WM's recognition is downstream of that layer. Neither holds as stated. A `CGEventTap`
 sees `CGEvent`s, and magnification is not a `CGEvent` type; a global `NSEvent` monitor observes and
 cannot modify or consume; a local monitor only sees events delivered to its own application. The only
-place genuinely upstream of the WM's recogniser is inside the WM, which is where the payload already
-runs, but the payload has no timers, no file I/O, no Objective-C dispatch, and acts only when patched
+place genuinely upstream of the WM's recogniser is inside the WM, which is where the component already
+runs, but the component has no timers, no file I/O, no Objective-C dispatch, and acts only when patched
 code runs. Adding a site on a hypothetical magnify handler would need a new locator signature and
 evidence that such a handler exists; the strip exposes no resize affordance, so there is no reason to
 think it does.
@@ -172,7 +172,7 @@ resulting scale.
 
 5. If it passes, the one remaining question is the case that matters: does the callback still arrive
    when `WindowManager` is frontmost and the pointer is over the strip? If yes, feed the scale into the
-   payload through the path `ctl.py` already uses (`I.write_cfg` over the task port), with a lighter
+   component through the path `ctl.py` already uses (`I.write_cfg` over the task port), with a lighter
    write than `cfg_set()` and a generation that cannot repeat; gate on the pointer being inside the
    strip rectangle; and measure latency at `s = 1.0 → 1.2` against the 167–212 ms figure for the
    interrupt-based trigger.
@@ -202,7 +202,7 @@ Verified while writing this note:
 Recorded during the original work, not re-run for this note:
 
 - `IOHIDEventCreateScaleEvent` dispatch returns `0x540000` as root and `0x5040000` as user, and no
-  magnify `NSEvent` is produced. Re-running it would inject an input event into the session, so it was
+  magnify `NSEvent` is produced. Re-running it would place an input event into the session, so it was
   deliberately not repeated.
 - Five phase-tagged gesture posts over the strip changed geometry 0 times; the strip exposes no resize
   accessibility action and no drag handle, and its width follows its tiles.

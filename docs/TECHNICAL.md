@@ -3,6 +3,14 @@
 This document describes how Sturgeon works, the constraints it operates under, and how to keep it
 working across macOS releases.
 
+## Terminology
+
+**The component** is the small position-independent block of code Sturgeon places inside
+`WindowManager` at arm time (`wmship/payload.c`, built to `payload.img`). **A site** is one of the six
+code locations redirected to it. **Arming** installs the component and the redirects; **disarming**
+restores the original bytes byte-for-byte. The `doctor` check verifies a build before anything is
+written.
+
 ## The constraint
 
 Stage Manager is implemented by `WindowManager`, a system process. The four capabilities Sturgeon
@@ -16,13 +24,13 @@ interface for any of them:
   entitlement, so it cannot be called by any third-party process.
 - Accessibility actions on strip tiles switch stages; they do not assign a window to a set.
 
-Sturgeon therefore patches `WindowManager` in memory: a small position-independent payload is
+Sturgeon therefore patches `WindowManager` in memory: a small position-independent component is
 allocated inside the process, six sites in its code are redirected to it, and the process continues
 running normally. Nothing is written to disk, and the patch is removed on `stop` or on any restart of
 the process.
 
 This requires root and System Integrity Protection to be disabled. Those are prerequisites, not
-bypasses: with SIP enabled, `task_for_pid` against a platform binary is refused by the kernel.
+workarounds: with SIP enabled, `task_for_pid` against a platform binary is refused by the kernel.
 
 ## Architecture
 
@@ -31,7 +39,7 @@ menu-bar app ──► wmship.sh ──► bin/asroot ──► install.py ─�
                     │              (verbs)        │
                     │                             └─ payload.c  (compiled, copied into the process)
                     │
-                    ├─ ctl.py      capability commands over the payload's control page
+                    ├─ ctl.py      capability commands over the component's control page
                     └─ wmlocate.py resolves the six sites from binary content
 ```
 
@@ -40,7 +48,7 @@ menu-bar app ──► wmship.sh ──► bin/asroot ──► install.py ─�
   functions. Each candidate is validated against instruction class, caller/callee relationships and
   the target argument registers. Results are cached per build (`<CFBundleVersion>|<sha256 of __TEXT>`)
   in `sites.json`.
-- **The payload** is built as plain `arm64` and copied into an anonymous executable region close
+- **The component** is built as plain `arm64` and copied into an anonymous executable region close
   enough to the patched sites for a direct branch. It contains no file I/O and no Objective-C
   dispatch; all communication happens through a page that the tool reads and writes over the task
   port.
@@ -91,9 +99,9 @@ other (#6):
   mode.
 - **`armed`** — `state.json` describes the running WindowManager, and every site holds the stub
   bytes recorded in `backup.json`; each stub lands inside the recorded island; the running body's
-  r-x code region (everything before the first `__DATA` page) matches the payload image on disk by
+  r-x code region (everything before the first `__DATA` page) matches the component image on disk by
   sha256 (#42). That region is copied verbatim and never written again — unlike `__DATA`, which
-  install and the payload use for the config, heartbeat and log buffers — so the digest cannot
+  install and the component use for the config, heartbeat and log buffers — so the digest cannot
   false-fail on a healthy install. `backup.json` entries written by older builds under the legacy
   key `driverE` are read as `birthE`; no file is rewritten.
 
@@ -112,7 +120,7 @@ so auto resolves to `pristine` and the comparison is against the on-disk image. 
 
 ### Memory the patch owns
 
-The payload is one 16 KB island page taken from a dead page near the patched code and one
+The component is one 16 KB island page taken from a dead page near the patched code and one
 anonymous body. Every installed site is one branch away from the island, so the island must be
 **executable** before the first site is patched, and the body must be executable where the island
 branches into it.
@@ -150,7 +158,7 @@ port: a write or a fetch against a page without the right protection is `SIGBUS`
 **New windows join the current stage.** The instantiation driver is called once per element while a
 window is being adopted. Sturgeon substitutes a one-element operation that targets the current
 stage's window set. The newborn is identified from the process's own serial-to-window-ID table, so no
-Objective-C introspection is involved. Measured cost from window creation to injection: 58–72 ms.
+Objective-C introspection is involved. Measured cost from window creation to placements: 58–72 ms.
 
 **Move a window between stages.** The same operation type is submitted for an existing window, which
 moves it to the chosen set. The observable change is verified through the process's accessibility
@@ -191,7 +199,7 @@ animation time, not computation, is why the pointer moves while it runs.
 
 A full teach pass is one sweep over the tiles. If a tile has not settled when the sweep ends,
 `wait_bases` supplies a short **wake**: it hovers a tile that already has a base, returns to the
-gutter, and waits for the payload's settled flags, with a 2.5 s ceiling. The sweep starts and ends
+gutter, and waits for the component's settled flags, with a 2.5 s ceiling. The sweep starts and ends
 in the gutter at `x=3`, never inside a tile. A park inside a tile re-hovers it after the last real
 visit and leaves its candidate as the sweep's final write; a candidate needs a later keeper call to
 be promoted, so that tile would end the pass unsettled. Once the bases are known, `resize` reuses
@@ -264,7 +272,7 @@ strip-on-top replays.
 Both are **promoted, not captured**. A candidate becomes the pose only after **8 state documents**
 have arrived with no newer write for that window (`SETTLE_TICKS`), and only while the document still
 says the strip is drawn — re-checked at promotion, not only at write time. The tick clock is the
-document's own seqlock generation, not wall-clock time and not the payload's call rate: a payload
+document's own seqlock generation, not wall-clock time and not the component's call rate: a component
 that was not called for a while still counts the documents it missed, and a loaded machine cannot
 shrink the window. A base candidate that a newer write supersedes before it settles — or that reaches
 the 3 s TTL — is counted as `unsettled`. The TTL is a wall-clock ceiling so a candidate is not kept
@@ -299,7 +307,7 @@ real set change, not a reproduction of a 1.575 render.
 ### The pose trace
 
 `cfg trace=true` (default off) makes the keeper write a record for each decision it takes about a
-strip window into a 16 KB ring (`io_tr` in the payload's control page). Read it with `wmship.sh
+strip window into a 16 KB ring (`io_tr` in the component's control page). Read it with `wmship.sh
 trace`; `wmship.sh trace --reset` zeroes the ring and its counters. The reader goes through the task
 port, sorts records by sequence number, and a record never straddles the end of the ring, so a line
 is either whole or absent. `io_tr_len` (bytes ever written) and `io_tr_seq` (records ever written)
@@ -338,8 +346,8 @@ same sweep produced no new records and the next teach's decisions were unchanged
 
 The menu-bar app's **Pose trace** toggle writes the `trace` key. **Show trace** runs `wmship.sh
 trace` and shows the last 40 records with this legend. The read has three states: records,
-`unavailable` (the command succeeded but the ring returned nothing — an older payload without the
-trace ring, or no keeper decision yet), and `failed` (the refusal line). An older payload therefore
+`unavailable` (the command succeeded but the ring returned nothing — an older component without the
+trace ring, or no keeper decision yet), and `failed` (the refusal line). An older component therefore
 shows `unavailable`, not an empty table. The toggle is disabled while disarmed, and turning the
 trace off drops the last read.
 
@@ -362,7 +370,7 @@ against a running daemon.*
 held and the pointer is inside the strip's rect read from the accessibility tree; every other
 scroll passes through. The default chord is **Control + Option** (Option + scroll alone is zoom in
 several apps). The value is clamped to 0.4–1.5, snapped to exactly 1.0 within 2%, limited to one
-step per 16 ms, and written straight into the payload config (`cfg_gen`) — not through the
+step per 16 ms, and written straight into the component config (`cfg_gen`) — not through the
 sweep-based `resize`. A HUD next to the strip shows the percentage. *Unit-tested: chord matching,
 clamp, snap, the accumulator that keeps the snap zone passable, rate limit. Unverified: the tap and
 HUD against live WindowManager geometry and input permissions.*
@@ -377,7 +385,7 @@ hit-test and its four decisions. Unverified: a live drag onto WindowManager tile
 
 ## State channel
 
-The payload cannot read files, so the tool publishes a small JSON document into its control page:
+The component cannot read files, so the tool publishes a small JSON document into its control page:
 strip geometry, each drawn rail tile's frame, which windows are in the rail, the front window, and
 the current phase. The document is written under a seqlock; readers take the generation, copy, and
 retry if it moved. Readers also check that the document is complete — a prefix that happens to
@@ -445,10 +453,10 @@ Known weak points, in the order they are worth hardening:
 
 ## Performance
 
-- Window creation to injection: 58–72 ms, no debugger attached. This is the injection cost; the
+- Window creation to placements: 58–72 ms, no debugger attached. This is the placements cost; the
   end-to-end birth capability did not reproduce on the last attempt (see Verification).
 - Per-tile transform replay: the WindowManager's own transaction API, no polling loop in the target.
-- The payload contains no timers; it acts only when the patched code runs.
+- The component contains no timers; it acts only when the patched code runs.
 - A `resize` that has to teach pays one pointer sweep over the tiles, plus a short wake (2.5 s
   ceiling) only when a tile has not settled; later calls reuse the bases and pay only the
   measurement sweeps. A complete `resize` finishes in tens of seconds, not minutes.
@@ -463,7 +471,7 @@ Known weak points, in the order they are worth hardening:
 | Private XPC service | Entitlement-gated; not callable from a third-party process |
 | Accessibility actions on tiles | Switch stages; do not assign windows |
 | Attaching a debugger | Works, but adds latency to every hit and leaves a debugger resident |
-| In-memory payload, read-only outside | Chosen: no debugger, no disk changes, reversible on stop |
+| In-memory component, read-only outside | Chosen: no debugger, no disk changes, reversible on stop |
 | Synthetic gesture input for resize | No supported way to create the magnification event; drive the transform directly instead ([pinch research](RESEARCH-pinch.md)) |
 | Deriving the pose from a measured frame | Not viable: the frame is the drawn frame, the translation is not in screen coordinates, and there is no event to calibrate against — teaching stays ([docs/GEOMETRY.md](GEOMETRY.md)) |
 
@@ -484,7 +492,7 @@ Known weak points, in the order they are worth hardening:
    should translate without changing `m0` (`r=1` marks the retract frames). Turn it off afterwards.
    `wmship.sh poses` remains the pose table and `wmship.sh warm` makes the WindowManager re-emit.
    If either shape is untrue, the teach pass needs revisiting before resize can be trusted.
-6. Rebuild the payload, then verify: births, move, strip on top, resize. Numbers, not impressions.
+6. Rebuild the component, then verify: births, move, strip on top, resize. Numbers, not impressions.
 
 ## Verification
 
@@ -501,7 +509,7 @@ What has actually been exercised, and what has not, on the current tree:
 | Strip-on-top | owner-verified: 6/6 tiles at layer 3 above a flush window, three trials with zero taught bases and three with thirteen, still out 2 s later. Re-measurement was partial: the replay/raise path ran and the one tile composited in a full-screen Space measured layer 3, but 6/6 could not be re-measured (the Space composited only that tile; a same-Space flush was reverted by the window manager) |
 | Resize | owner-verified: every tile 1.490–1.500 at 1.5 and 0.600–0.612 at 0.6, exact restore of x/y/w/h; the derived pivot proved from the frames at x 13–16, y 507–509 against the pinned constant's y 489–491, and `resize 1.0`'s x/y check passed on seven tiles |
 | Stale bases (#4) | mechanism owner-verified: an in-place rail id-set change dropped every base (`bases 14 → 0`, `railchg 0 → 1`) and a following `resize 1.5` scaled every remaining tile (1.490–1.510). The "remaining tiles are drawn wider" premise did not reproduce on this WindowManager build, so the issue stays open with `Refs`, not `Closes` |
-| Births | implemented, **unverified end-to-end**: the last two attempts injected nothing (`inject=0`) and the window became a strip tile |
+| Births | implemented, **unverified end-to-end**: the last two attempts placed nothing (`place=0`) and the window became a strip tile |
 | `selfcheck` | logic and app gate unit-tested (#35); the pass path on a live armed install has not been observed — owner check |
 | App diagnostics, gesture resize, drop-to-tile | decision code unit-tested; live paths **not exercised** against an armed WindowManager |
-| Pose trace | **present**; owner-verified: one hover sweep wrote 143 records, largest 113 bytes; with `trace=false` no new records appeared and the next teach's decisions were unchanged (`bases 14 → 14`). Write-only, asserted by `wmship/selftest.py`. The app's **Pose trace** toggle writes `trace`; **Show trace** reads the ring and shows the last 40 records, or `unavailable` on an older payload |
+| Pose trace | **present**; owner-verified: one hover sweep wrote 143 records, largest 113 bytes; with `trace=false` no new records appeared and the next teach's decisions were unchanged (`bases 14 → 14`). Write-only, asserted by `wmship/selftest.py`. The app's **Pose trace** toggle writes `trace`; **Show trace** reads the ring and shows the last 40 records, or `unavailable` on an older component |

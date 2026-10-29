@@ -15,7 +15,7 @@ Working notes for this repository. Read this before changing code.
 | `pack/` | release signing, notarization, stapling and the casks |
 | `tools/` | proof helper `axui` and the icon generator |
 | `wmship.sh` | the user-facing tool entry point (`start`, `stop`, `status`, `doctor`, `resize`, …) |
-| `wmship/` | installer, capability CLI, payload source, daemon, build scripts; `selftest.py` proves the memory guards |
+| `wmship/` | installer, capability CLI, component source, daemon, build scripts; `selftest.py` proves the memory guards |
 | `helpers/asroot.c` | the privileged entry point: a fixed verb dispatcher, not a shell |
 | `wmlocate.py` | resolves the patch sites from binary content |
 | `wm/`, `a/` | helper sources (window probing, stage listing) |
@@ -27,7 +27,7 @@ Working notes for this repository. Read this before changing code.
 
 ```sh
 ./scripts/build-helpers.sh       # helper binaries (clang/swiftc from the command line tools)
-( cd wmship && ./build.sh )      # payload image
+( cd wmship && ./build.sh )      # component image
 swift build -c release           # the app executable
 swift test                       # the package tests (no root, no WindowManager)
 ./scripts/build-app.sh           # assemble dist/Sturgeon.app from .build + Resources + the tool tree
@@ -68,13 +68,13 @@ concurrent installs invalidate each other.
 - The two SkyLight functions live in the dyld shared cache, which is slid per process. Compute their
   live address as the WindowManager's own image base plus the file offset, on every run.
 
-**The payload**
+**The component**
 
-- No `objc_msgSend` from the payload: dispatch is not safe in that context. Use plain C APIs or read
+- No `objc_msgSend` from the component: dispatch is not safe in that context. Use plain C APIs or read
   the WindowManager's own structures.
-- The payload has no file I/O. Its control block is one page in the target process, read and written
+- The component has no file I/O. Its control block is one page in the target process, read and written
   over the task port from outside.
-- Build the payload as `arm64`, not `arm64e`; authenticated calls cannot work with a raw pointer.
+- Build the component as `arm64`, not `arm64e`; authenticated calls cannot work with a raw pointer.
 - Objects handed to Swift must be retained exactly once; the target owns its release.
 
 **The strip keeper**
@@ -103,7 +103,7 @@ concurrent installs invalidate each other.
 - Both poses are **promoted after 8 state documents with no newer write for that window**
   (`SETTLE_TICKS`), never captured per write, and only while the document still says the strip is
   drawn — re-checked at promotion. Ticks are the document's seqlock generation, not wall-clock time
-  or the payload's call rate, so load cannot shrink the window. A base candidate a newer write
+  or the component's call rate, so load cannot shrink the window. A base candidate a newer write
   supersedes, or one that reaches `CAND_TTL` (the wall-clock ceiling), is counted in `unsettled`.
 - `base` is also the largest `m0` the tile shows (a hover lift is the smaller value). It is dropped
   when the strip leaves **and when the rail's app-tile id-set changes while the strip is drawn**: an
@@ -156,7 +156,7 @@ concurrent installs invalidate each other.
   16 KB ring, no branch reads `io_tr`, and `wmship/selftest.py` asserts that. Read it with
   `wmship.sh trace [--reset]`; the field legend is in `docs/TECHNICAL.md`. It cannot change a
   decision, but turn it off when the diagnosis is done. The app's **Pose trace** toggle writes
-  `trace`, and **Show trace** reads the ring; an older payload shows `unavailable`, not an empty
+  `trace`, and **Show trace** reads the ring; an older component shows `unavailable`, not an empty
   table.
 - Verify with numbers (window layers, per-tile geometry), not with screenshots of intent.
 
@@ -173,7 +173,7 @@ When a new build appears:
    add it to `wmship/profile.json` under `<CFBundleVersion>|<sha256 of __TEXT>`.
 3. A site no longer matches → update the structural signature in `wmlocate.py`, then prove it against
    a shifted copy of the binary and a corrupted copy that must refuse.
-4. Rebuild the payload. Before releasing, confirm `pivmiss` stays 0 and `psrc` is 1 across a resize,
+4. Rebuild the component. Before releasing, confirm `pivmiss` stays 0 and `psrc` is 1 across a resize,
    and use `cfg trace=true` + `wmship.sh trace` to check that a hover still returns to a settled
    value and a hide still translates without changing `m0`. If the rail yields no pivot, fix the
    derivation; do not pin the old constant. Then run the four capability checks.
