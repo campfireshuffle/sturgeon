@@ -165,17 +165,37 @@ static char *snap(char *dst, const char *src, u32 n, u32 max) {
 #define MAXIDS 32
 #define MAXUSED 24
 
+// Two poses per window, because strip-on-top and resize want different things from a pose and
+// coupling them made one capability regress whenever the other was tightened (issue #20):
+//
+//   base  the RESTING pose -- the one the WM writes and then stops writing.  Set only by the
+//         teach gate, reset when the strip retracts.  This is the only pose that may be scaled.
+//   rp    the REPLAY transform -- the last pose the WM wrote that draws the tile on screen.
+//         Taught from any settled write while the strip is drawn, kept across a hide so a flush
+//         has something to put back, and never scaled.
 struct pose {
     u64 wid;
     u8 used, hasbase, hasmine, haslvl;
     u8 lvl;
-    u8 pad[3];
-    double t_base;      // when the base was taught
-    double lx, ly;      // the previous write's translation (to tell a settle from a departure)
-    u8 haslast;
-    u8 pad2[3];
+    u8 hasrp;
+    u8 pad[2];
+    double t_base;      // when the resting base was taught
     u8 base[128];
+    u8 rp[128];
     u8 mine[128];
+    // A base is promoted, not captured: `cand` is the last legal write and `cand_ok` says a later
+    // write has not contradicted it.  A hover lift and a mid-animation frame are superseded within
+    // milliseconds; the resting pose is followed by silence (this build: no writes while idle).
+    double cand[16];
+    double t_cand;
+    u8 cand_ok;
+    u8 pad3[7];
+    // The replay transform is promoted the same way -- a pose the WM stops writing -- but from
+    // looser candidates, because on-top must not depend on the strict resting base at all.
+    double rpcand[16];
+    double t_rpcand;
+    u8 rpcand_ok;
+    u8 pad4[7];
 };
 struct globals {
     double t_cfg, t_state, t_req, t_pend, t_log, t_hb;
@@ -210,6 +230,11 @@ struct globals {
     u64 used_ser[MAXUSED]; int n_used;
     u32 done_cgid[MAXUSED]; int n_done;
     u64 n_keep, n_learn, n_dil, n_replay, n_level, n_apply, n_inject, n_drv, n_cmp, n_miss;
+    u64 n_rp;              // replay transforms refreshed (issue #20's coverage counter)
+    // what the last replay actually put back: without this "the strip did not come back" cannot be
+    // told apart from "the strip came back at the hidden pose" (diagnostic only)
+    double dbg_rp0, dbg_rpx, dbg_rpy, dbg_b0;
+    double t_out_since;    // when the document last said the strip is out (candidate validity floor)
     u64 n_rdv, n_cfg, n_birth_call, n_birth_empty, n_desc_try;
     u64 n_desc_ok, n_desc_bad, n_ret, n_rej;
     long rdv_ms, rdv_ms_max;
@@ -311,19 +336,26 @@ static void poses_write(void) {
 static void hb_write(void) {
     char *o = io_hb;
     int p = 0;
-    int nb = 0, nr = 0;
+    int nb = 0, nr = 0, nrp = 0;
     for (int i = 0; i < MAXP; i++) {
         if (!G.pose[i].used) continue;
         if (G.pose[i].hasbase) nb++;
+        if (G.pose[i].hasrp) nrp++;
         if (G.pose[i].haslvl && G.pose[i].lvl == 3) nr++;
     }
     o[p++] = '{';
     p = key64(o, p, "bases", (u64)nb);      o[p++] = ',';
+    p = key64(o, p, "rps", (u64)nrp);       o[p++] = ',';
     p = key64(o, p, "raised", (u64)nr);     o[p++] = ',';
     p = key64(o, p, "keep", G.n_keep);      o[p++] = ',';
     p = key64(o, p, "learn", G.n_learn);    o[p++] = ',';
     p = key64(o, p, "dil", G.n_dil);        o[p++] = ',';
     p = key64(o, p, "replay", G.n_replay);  o[p++] = ',';
+    p = key64(o, p, "rpn", G.n_rp);         o[p++] = ',';
+    p = key64(o, p, "rp0", (u64)(i64)(G.dbg_rp0 * 1e4)); o[p++] = ',';
+    p = key64(o, p, "rpx", (u64)(i64)G.dbg_rpx); o[p++] = ',';
+    p = key64(o, p, "rpy", (u64)(i64)G.dbg_rpy); o[p++] = ',';
+    p = key64(o, p, "b0", (u64)(i64)(G.dbg_b0 * 1e4)); o[p++] = ',';
     p = key64(o, p, "level", G.n_level);    o[p++] = ',';
     p = key64(o, p, "apply", G.n_apply);    o[p++] = ',';
     p = key64(o, p, "inject", G.n_inject);  o[p++] = ',';
@@ -1399,9 +1431,16 @@ static void apply_all(void) {
     for (int i = 0; i < G.n_rail && n < MAXP; i++) {
         struct pose *p = pose_get(G.rail_ids[i], 0);
         if (!p || !p->used) continue;
+        // A pose can exist before it has a base -- a written window whose write was not a legal
+        // resting candidate.  Replaying `p->base` for one of those hands the WM the zero matrix,
+        // which is not a no-op: it is a degenerate transform, and it is how apply_all used to be
+        // able to hurt WindowManager.  Scaling needs the resting base; a level-only apply can use
+        // the replay transform, which every drawn tile has.
+        int scaled = !feq(s, 1.0);
+        if (scaled ? !p->hasbase : !(p->hasbase || p->hasrp)) continue;
         double base[16];
-        memcpy(base, p->base, 128);
-        if (!feq(s, 1.0)) mat_scale(base, s, G.qx, G.qy, mm[n]);
+        memcpy(base, (scaled || p->hasbase) ? p->base : p->rp, 128);
+        if (scaled) mat_scale(base, s, G.qx, G.qy, mm[n]);
         else memcpy(mm[n], base, 128);
         ids[n++] = G.rail_ids[i];
     }
@@ -1444,17 +1483,73 @@ static int is_retract(const double *m, const u8 *b) {
 // pose translation is not in screen coordinates (round 34 measured a gate built on m[12] >= 0
 // refuse *every* write: learn +0 over two full sweeps).
 
-// A write is a *departure* if it moves further from the taught pose than the previous write did,
-// and by more than a tile's own hover jitter.  The retract animation is a departure on every
-// frame; the return to rest after a hover lift is the opposite -- it moves back toward the base --
-// so the resting pose still wins, which is what `resize` needs to be exact.
-static int is_departure(const struct pose *p, const double *m) {
-    if (!p->haslast) return 0;
-    double dxn = m[12] - ((const double *)p->base)[12], dyn = m[13] - ((const double *)p->base)[13];
-    double dxp = p->lx - ((const double *)p->base)[12], dyp = p->ly - ((const double *)p->base)[13];
-    double dn = (dxn < 0 ? -dxn : dxn) + (dyn < 0 ? -dyn : dyn);
-    double dp = (dxp < 0 ? -dxp : dxp) + (dyp < 0 ? -dyp : dyp);
-    return dn > 24.0 && dn >= dp;
+// ---- a resting base is a pose the WM stops writing -------------------------------------------
+// Measured on this build: one hover animates a tile through hundreds of distinct scale values in
+// ~0.5 s, the resting pose is written once, and the next write for that window comes ~0.3 s later
+// or never (idle produces no writes at all).  So "is this write the rest pose" is answered by
+// time, not by a value.  Record every legal write as a candidate and promote it only when the
+// window has been written nothing else for QUIET.  A lift cannot pass that test -- it is followed
+// by the settle writes when the pointer leaves -- and neither can a mid-animation frame.
+//
+// The round-34 rule this replaces ("keep the smallest pose") never gated at all: `p->base` is a
+// u8[128], so `p->base[0]` is ONE BYTE of the base's first double, an integer no scale can be
+// smaller than.  It kept the last write of a sweep -- a hover lift -- which is where 1.58 came
+// from.  Cast to double before comparing, always.
+#define QUIET   0.22    // longer than the longest gap inside one animation (measured 0.13 s)
+#define CAND_TTL 3.00   // longer than one sweep's period (2 passes over tiles, measured ~3 s)
+static int strip_out_now(void) {
+    return G.st_ok && G.strip_on && G.n_rail > 0 && G.rail_x >= 0.0
+           && G.has_frontx && G.front_x > 60.0;
+}
+// Promote one settled candidate.  The document is re-read HERE, not at write time: a retract that
+// started after the write has closed the strip by now (25 ms ticks), so the candidate the keeper
+// stopped hearing about is only trusted while the strip is still drawn.
+static void promote_one(struct pose *p, double t, int out) {
+    p->cand_ok = 0;
+    if (!out) return;                       // candidates are recorded only at scale 1.0, strip out
+    if (p->hasbase && memcmp(p->base, p->cand, 128) == 0) return;
+    // A base is the LARGEST m0 a tile shows.  m0 is natural divided by drawn, so a hover lift --
+    // the tile drawn ~6% larger -- is the *smaller* value, and the resting pose is the largest.
+    // Quiet promotion alone cannot tell them apart: a pointer that comes to rest on a tile lifts
+    // it and the WM then stops writing, which is exactly the shape of a settle (measured: 1.883 at
+    // rest, 1.775 lifted).  Without this test that lift becomes the base and `resize 1.5` renders
+    // `1.5 x 1.06` -- round 34 by another route.  Cast to double: `p->base` is a u8[128], and
+    // `p->base[0]` is one byte of the double, which is how round 34 shipped a 5% error.
+    if (p->hasbase && ((const double *)p->cand)[0] < ((const double *)p->base)[0] - 1e-9) return;
+    memcpy(p->base, p->cand, 128);
+    p->hasbase = 1;
+    p->t_base = t;
+    G.n_learn++;
+}
+// Called (a) before this window's next write -- a write that arrives QUIET after a candidate is
+// the proof that the candidate was the end of its animation -- and (b) at a cfg generation change,
+// which is where the base is actually consumed.  Idle produces no writes at all, so (b) is what
+// settles the last tile of a sweep.
+static void promote_one_rp(struct pose *p, double t, int out) {
+    p->rpcand_ok = 0;
+    if (!out) return;                       // never take the hidden pose, whatever it looked like
+    if (p->t_rpcand < G.t_out_since) return; // written before the strip came out: not this drawing
+    if (p->hasrp && memcmp(p->rp, p->rpcand, 128) == 0) return;
+    memcpy(p->rp, p->rpcand, 128);
+    p->hasrp = 1;
+    G.n_rp++;
+}
+
+static void promote_bases(void) {
+    double t = now();
+    int out = strip_out_now();
+    for (int i = 0; i < MAXP; i++) {
+        struct pose *p = &G.pose[i];
+        if (!p->used) continue;
+        if (p->cand_ok) {
+            if (t - p->t_cand > CAND_TTL) p->cand_ok = 0;
+            else if (t - p->t_cand >= QUIET) promote_one(p, t, out);
+        }
+        if (p->rpcand_ok) {
+            if (t - p->t_rpcand > CAND_TTL) p->rpcand_ok = 0;
+            else if (t - p->t_rpcand >= QUIET) promote_one_rp(p, t, out);
+        }
+    }
 }
 
 // No leaked level: once the phase is over (or the window is no longer a strip member) every window
@@ -1483,6 +1578,7 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     int strip = in_ids(wid, G.strip_ids, G.n_strip);
     int rail = in_ids(wid, G.rail_ids, G.n_rail);
     if (!force && fresh) level_sweep(txn);      // no-op while a flush is replaying
+    if (!force && fresh) promote_bases();       // any write can settle another window's candidate
     if (!strip && !rail) return;
     double m[16];
     memcpy(m, (const void *)matp, 128);
@@ -1509,51 +1605,103 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     } else if (!prev) {
         G.hold_until = now() + 0.30;              // let the reveal animation settle
     }
+    if (out && !prev) G.t_out_since = now();
     G.was_out = out;
-    int retract = p->hasbase && is_retract(m, p->base);
-    int away = p->hasbase && is_departure(p, m);
-    if ((retract || away) && !force) G.hold_until = now() + 0.50;
-    // A base is only ever taught while the strip is genuinely out, so it cannot be the hidden
-    // pose, and it is kept across the hide: it is exactly what the replay needs when a flush
-    // arrives.  What is discarded on a hide is the state of windows that are no longer part of
-    // the strip at all -- a window that comes back into the strip re-teaches its current layout
-    // instead of replaying an old one.  (Round 32's complaint was bases taught *during* the
-    // retract; the gate above is what prevents those, and clearing every base on every hide cost
-    // the next trial its coverage: 5 of 6 tiles replayed, measured.)
+    int retract = (p->hasbase && is_retract(m, p->base)) || (p->hasrp && is_retract(m, p->rp));
+    if (retract && !force) G.hold_until = now() + 0.50;
+    // A base describes the drawing that is on screen right now, so it is dropped when that
+    // drawing goes away -- for strip members too.  That is what makes "keep the largest m0" safe:
+    // a layout change (fewer tiles, a different stage, a different strip scale) arrives through a
+    // hide, so the next teach pass starts from an empty base instead of being pinned to a pose
+    // from a drawing that no longer exists.  The replay transform is what has to survive the
+    // hide, and `rp` is a separate field precisely so this one does not have to.
     if (prev && !out && !force)
         for (int i = 0; i < MAXP; i++) {
             struct pose *q = &G.pose[i];
             if (!q->used) continue;
-            if (in_ids(q->wid, G.strip_ids, G.n_strip)) continue;
             q->hasbase = 0;
+            if (in_ids(q->wid, G.strip_ids, G.n_strip)) continue;
+            q->hasrp = 0;
             q->hasmine = 0;
             q->haslvl = 0;
         }
-    // A base is the SMALLEST pose the WM draws outside a retract.  A hover *lift* is the same tile
-    // drawn ~5.5% larger, and it is not a layout: the WM restores the resting pose from its own
-    // copy when the pointer leaves, without going through this hook -- so a lift that is learned
-    // stays the base and `resize` then renders `s x lift`.  Round 34 measured exactly that: the
-    // five tiles taught from a lift rendered 1.5 as 1.579-1.587, the two taught at rest 1.500.
-    // So: learn downward.  A retract/away pose is still excluded geometrically (round 32's D2),
-    // and only a strictly smaller m[0] replaces an existing base.
-    int smaller = !p->hasbase || m[0] < p->base[0] - 1e-9;
-    if (G.teach && !force && feq(s, 1.0) && !ours && !is_identity(m) && out
-        && now() >= G.hold_until && !retract && !away && smaller) {
-        if (memcmp(p->base, m, 128) != 0 || !p->hasbase) {
-            memcpy(p->base, m, 128);
-            p->hasbase = 1;
-            p->t_base = now();
-            G.n_learn++;
-        }
+
+    // ---- the replay transform (issue #20) ------------------------------------------------------
+    // Strip-on-top needs a pose that keeps the tile drawn, for every tile, immediately.  The
+    // resting base cannot do that job: it is deliberately strict and a tile that has not been
+    // taught yet has none, which is exactly why tightening the teach gate took on-top from 7/7 to
+    // 3/7.  So the two uses have two fields.
+    //
+    // The rule, stated exactly as the code implements it -- there is no geometric test on the
+    // write, and an earlier version of this comment claimed one that did not exist:
+    //
+    //   1. every write that arrives while the document says the strip is drawn and that is not our
+    //      own becomes the *candidate* (`rpcand`);
+    //   2. a candidate is promoted only after QUIET (0.22 s) with no newer write for that window,
+    //      and only if the document still says the strip is drawn at promotion time;
+    //   3. a candidate written before the strip last came out (`t_out_since`) is never promoted.
+    //
+    // The margins that make that safe against a retract, which is what it has to survive:
+    //   * the longest gap *inside* one animation is 0.13 s (measured on this build), so a frame of
+    //     an animation is always superseded before QUIET elapses;
+    //   * the document is republished every ~25 ms (`r21obs`), and a retract is ~0.3 s of writes,
+    //     so `out` goes false within a tick or two of the retract starting: the last retract frame
+    //     would have to be followed by 0.22 s of silence *and* the document would have to still
+    //     say "drawn", which is 25 ms of lag against 220 ms of quiet -- it cannot be both;
+    //   * and if it somehow were, rule 3 rejects it: after the next reveal `t_out_since` is newer
+    //     than that candidate.
+    // This replaced a per-write refresh, which does follow the strip out: measured, six tiles
+    // replayed at the retracted pose and never came back.
+    //
+    // `ours` stays part of THIS one: a replay transform only has to keep the tile drawn, so a
+    // lift pose is acceptable, while our own scaled matrix (written during a resize) is not.
+    if (!ours && !is_identity(m) && out) {
+        memcpy(p->rpcand, m, 128);
+        p->t_rpcand = now();
+        p->rpcand_ok = 1;
+    } else {
+        p->rpcand_ok = 0;
+    }
+
+    // The resting base: the last write the WM made for this window and then stopped writing for
+    // QUIET seconds.  Every gate above still decides *what may become a candidate* -- never a
+    // retract pose, never a write while the scale is not 1.0, never our own write, never inside a
+    // strip-transition hold -- and promotion happens in promote_bases(), where the document is
+    // re-read.  Promotion, not capture, is what makes the base a settled pose rather than a frame.
+    int hold_ok = now() >= G.hold_until;
+    // `!ours` is deliberately NOT part of this: the pose that matters most is the one the WM writes
+    // when it settles, and after a replay that pose is byte-identical to our own last write.  With
+    // `!ours` in the gate, teaching the resting pose failed whenever on-top had run first (measured:
+    // learn 0 across a full teach sweep, bases 0, resize a no-op).  Teaching our own 1.0 write is a
+    // no-op by construction (promote_one returns when the candidate already is the base), and at
+    // any other scale the `feq(s, 1.0)` term already excludes it.
+    int legal = feq(s, 1.0) && !is_identity(m) && out && hold_ok && !retract;
+    if (p->cand_ok && now() - p->t_cand >= QUIET && now() - p->t_cand <= CAND_TTL && G.teach)
+        promote_one(p, now(), out);      // this write proves the candidate ended its burst
+    if (!G.teach) {
+        // the tool is sweeping or measuring: record nothing, and do not throw away a candidate it
+        // taught earlier -- the scale change that follows promotes it.
+    } else if (legal) {
+        memcpy(p->cand, m, 128);
+        p->t_cand = now();
+        p->cand_ok = 1;
+    } else {
+        p->cand_ok = 0;                  // this write supersedes anything pending for this window
     }
     G.last_mx = m[12];
-    p->lx = m[12];
-    p->ly = m[13];
-    p->haslast = 1;
     if (force) {
-        if (strip && p->hasbase && !ours) {
-            memcpy((void *)matp, p->base, 128);
-            memcpy(p->mine, p->base, 128);
+        // Replay what was last drawn on screen, not what the tile rests at: under a flush the
+        // strip is behind a window, the resting pose is not what was there, and a tile that has a
+        // replay transform but no resting base still has to come back.  The base is the fallback
+        // for a tile that has not been drawn since this payload was installed.
+        const u8 *src = p->hasrp ? p->rp : (p->hasbase ? p->base : 0);
+        if (strip && src && !ours) {
+            G.dbg_rp0 = ((const double *)src)[0];
+            G.dbg_rpx = ((const double *)src)[12];
+            G.dbg_rpy = ((const double *)src)[13];
+            G.dbg_b0 = p->hasbase ? ((const double *)p->base)[0] : 0.0;
+            memcpy((void *)matp, src, 128);
+            memcpy(p->mine, src, 128);
             p->hasmine = 1;
             G.n_replay++;
         }
@@ -1580,10 +1728,12 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
             }
         }
     }
-    // Raise only a window we can actually keep on screen: under a flush that means one with a
-    // taught (visible) base, so a window that enters the rail during the transition is not lifted
-    // over the stage with nothing to replay.  The user's explicit `level 3` still raises the set.
-    int want = (strip && ((force && p->hasbase) || (G.level_manual == 3 && fresh))) ? 3 : 0;
+    // Raise only a window we can actually keep on screen.  Under a flush that means one we have a
+    // pose for at all (`rp` before the install's first teach), because a window lifted over the
+    // stage with nothing to replay is the "3 of 7 tiles" regression.  The user's explicit
+    // `level 3` still raises the whole set.
+    int want = (strip && ((force && (p->hasrp || p->hasbase))
+                          || (G.level_manual == 3 && fresh))) ? 3 : 0;
     if (strip && G.levels && fresh && SL.txn_level && (!p->haslvl || p->lvl != want)) {
         ((int(*)(u64, u32, int))SL.txn_level)(txn, wid, want);
         p->lvl = (u8)want;
@@ -1592,6 +1742,7 @@ static void keeper_body(u64 txn, u32 wid, u64 matp) {
     }
     if (G.gen != G.gen_applied) {
         G.gen_applied = G.gen;
+        promote_bases();     // settle anything pending before a base is used to scale
         apply_all();
     }
 }

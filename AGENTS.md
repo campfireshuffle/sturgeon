@@ -76,6 +76,13 @@ concurrent installs invalidate each other.
   evidence of a relayout.
 - The scale pivot is a constant (`16, 490`) today; if the strip geometry changes on a new build,
   re-derive it (docs/TECHNICAL.md, Fragility).
+- **Two poses per tile, and they are not interchangeable.** `base` is the resting pose and the only
+  thing that may be scaled; `rp` is the replay transform used by strip-on-top and is taught from
+  anything that settles while the strip is drawn. Tightening one must not blind the other: on-top
+  has to work for a tile with no taught base at all.
+- Never write a page that is not already writable, and never leave a page a branch points into
+  without execute permission. Both are `KERN_PROTECTION_FAILURE` inside `WindowManager`, and the
+  installer refuses rather than trying (`wmship/selftest.py` proves the guard without root).
 - Act only on a complete state document: `flush` and `rail_now` must be present and fresh. The
   document is published through a seqlock; read the length, then retry if the generation moves.
 
