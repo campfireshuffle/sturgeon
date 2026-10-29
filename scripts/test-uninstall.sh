@@ -181,6 +181,10 @@ move_conflicts_aside() {
 }
 restore_conflicts() {
   local f
+  # A failed run must not leave the throw-away tap holding the deliberately broken cask.
+  if [ -f "$ROOT/dist/sturgeon.rb" ]; then
+    cp "$ROOT/dist/sturgeon.rb" "$TAP_DIR/Casks/sturgeon.rb" 2>/dev/null || true
+  fi
   [ "${#CONFLICT_FILES[@]}" = 0 ] && return 0
   for f in "${CONFLICT_FILES[@]}"; do
     [ -e "$f.test-uninstall-backup" ] && mv "$f.test-uninstall-backup" "$f"
@@ -271,13 +275,25 @@ brew_uninstall() {   # brew_uninstall <logfile> [extra brew args…]
 }
 
 # The privileged leftovers a missing bundle cannot clean itself.  Only used by pass 3, after the
-# test has asserted that the cask did NOT silently claim to have removed them.
+# test has asserted that the cask did NOT silently claim to have removed them.  Wait for the
+# bootout and the daemon to actually finish before removing /tmp/wmship: `launchctl bootout`
+# returns first, and the dying wmshipd writes daemon.json on its way out (the same race the
+# `teardown` verb fixes inside asroot), so an immediate `rm -rf` leaves the directory behind.
 clean_leftovers() {
+  local i
   $SUDO /bin/launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
-  $SUDO /bin/rm -f "$PLIST" "$SUDOERS"
-  $SUDO /bin/rm -rf /tmp/wmship
+  for i in $(seq 1 40); do
+    $SUDO /bin/launchctl print "system/$LABEL" >/dev/null 2>&1 || break
+    sleep 0.25
+  done
   $SUDO /usr/bin/pkill -x wmhb 2>/dev/null || true
   $SUDO /usr/bin/pkill -f wmshipd.py 2>/dev/null || true
+  for i in $(seq 1 40); do
+    pgrep -f wmshipd.py >/dev/null 2>&1 || break
+    sleep 0.25
+  done
+  $SUDO /bin/rm -f "$PLIST" "$SUDOERS"
+  $SUDO /bin/rm -rf /tmp/wmship
 }
 
 cleanup_after_negative() {
@@ -436,9 +452,11 @@ if [ "$NEGATIVE" = 1 ]; then
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-text, n = re.subn(r"\n  uninstall script: \{.*?\n            \}\n", "\n", text, flags=re.S)
+text, n = re.subn(r"\n  uninstall script: \{\n    executable:.*?\n  \}\n", "\n", text, flags=re.S)
 if n != 1:
     raise SystemExit("could not remove exactly one uninstall stanza (removed %d)" % n)
+if "uninstall script:" in text or "zap trash:" not in text:
+    raise SystemExit("the broken cask is not shaped as intended")
 open(dst, "w").write(text)
 PY
   [ -f "$NEGDIR/sturgeon.rb" ] || die "could not build the broken cask"
@@ -466,7 +484,6 @@ PY
   rm -f "$NEG_LOG"
   cleanup_after_negative
   assert_uninstalled 1 || exit 1
-  cp "$ROOT/dist/sturgeon.rb" "$TAP_DIR/Casks/sturgeon.rb"   # put the good cask back
   rm -rf "$NEGDIR"
 fi
 
