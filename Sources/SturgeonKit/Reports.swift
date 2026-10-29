@@ -15,6 +15,9 @@ public struct StatusReport: Equatable {
     public var helper: [String]
     public var daemon: Daemon
     public var caps: Capabilities?
+    /// The aggregate heartbeat counters `status --json` carries (`inject`, `cmp`, `ret`,
+    /// `miss`, `rej`).  The keeper's fuller set comes from `install.py counters`.
+    public var counters: [String: Int]?
 
     public var isArmed: Bool { state == "ARMED" }
 
@@ -27,7 +30,8 @@ public struct StatusReport: Equatable {
                 debugger: String? = nil,
                 helper: [String] = [],
                 daemon: Daemon = Daemon(),
-                caps: Capabilities? = nil) {
+                caps: Capabilities? = nil,
+                counters: [String: Int]? = nil) {
         self.build = build
         self.pid = pid
         self.state = state
@@ -38,6 +42,7 @@ public struct StatusReport: Equatable {
         self.helper = helper
         self.daemon = daemon
         self.caps = caps
+        self.counters = counters
     }
 
     public struct Daemon: Equatable {
@@ -80,10 +85,11 @@ extension StatusReport: Decodable {
         helper = v(.helper, [String].self) ?? []
         daemon = v(.daemon, Daemon.self) ?? Daemon()
         caps = v(.caps, Capabilities.self)
+        counters = v(.counters, [String: Int].self)
     }
 
     private enum Key: String, CodingKey {
-        case build, pid, state, reason, debugger, helper, daemon, caps
+        case build, pid, state, reason, debugger, helper, daemon, caps, counters
         case sitesPatched = "sites_patched"
         case sitesTotal = "sites_total"
     }
@@ -197,24 +203,132 @@ extension DoctorReport.Check: Decodable {
     }
 }
 
-/// `ctl.py resize` — `{ok, tiles:[{ratio, ...}], err}`.
+/// What the popover says about a doctor run. `doctor` validates a *pristine* WindowManager by
+/// design, so while armed the six byte-equality checks fail on our own patch and only those
+/// failures are expected.
+public enum DoctorVerdict: Equatable {
+    case pass
+    case passArmed
+    case fail
+    case unavailable
+
+    public var label: String {
+        switch self {
+        case .pass: return "PASS"
+        case .passArmed: return "PASS (armed — live bytes carry the patch)"
+        case .fail: return "FAIL"
+        case .unavailable: return "unavailable"
+        }
+    }
+
+    public var isOK: Bool { self == .pass || self == .passArmed }
+}
+
+extension DoctorReport {
+    public func verdict(armed: Bool) -> DoctorVerdict {
+        if ok { return .pass }
+        let failed = failedChecks
+        let patchedOnly = !failed.isEmpty && failed.allSatisfy {
+            $0.check.hasSuffix(".file-eq-live") || $0.check.hasSuffix(".keeper-prologue")
+        }
+        if armed && patchedOnly { return .passArmed }
+        return .fail
+    }
+
+    /// The one line a bug report needs: the doctor's own first refusal, then its first failing
+    /// check, then a generic refusal.
+    public func refusalLine() -> String {
+        if let first = refusals.first, !first.isEmpty { return first }
+        if let bad = failedChecks.first {
+            return bad.detail.isEmpty ? bad.check : "\(bad.check): \(bad.detail)"
+        }
+        return "doctor refused"
+    }
+}
+
+/// `install.py counters` — the payload's heartbeat plus the injection log.  The six counters the
+/// diagnostics panel shows (`inject`, `miss`, `keep`, `learn`, `replay`, `dil`) all live in `hb`.
+public struct CountersReport: Equatable {
+    public var heartbeat: [String: Int]
+    public var injections: [Injection]
+    public var injectionCount: Int?
+
+    public init(heartbeat: [String: Int] = [:],
+                injections: [Injection] = [],
+                injectionCount: Int? = nil) {
+        self.heartbeat = heartbeat
+        self.injections = injections
+        self.injectionCount = injectionCount
+    }
+
+    public var isEmpty: Bool { heartbeat.isEmpty && injections.isEmpty }
+
+    public struct Injection: Equatable, Decodable {
+        public var wid: String
+        public var cgid: Int
+
+        public init(wid: String, cgid: Int) {
+            self.wid = wid
+            self.cgid = cgid
+        }
+    }
+}
+
+extension CountersReport: Decodable {
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Key.self)
+        heartbeat = (try? c.decodeIfPresent([String: Int].self, forKey: .hb)) ?? [:]
+        injections = (try? c.decodeIfPresent([Injection].self, forKey: .injected)) ?? []
+        injectionCount = try? c.decodeIfPresent(Int.self, forKey: .injectionCount)
+    }
+
+    private enum Key: String, CodingKey {
+        case hb, injected
+        case injectionCount = "inj_n"
+    }
+}
+
+/// `ctl.py resize` — `{ok, s, tries, tiles:[{id, owner, w, natural, ratio}], err}`.
 public struct ResizeReport: Equatable {
     public var ok: Bool
     public var err: String?
+    public var scale: Double?
+    public var tries: Int?
     public var tiles: [Tile]
 
-    public init(ok: Bool = false, err: String? = nil, tiles: [Tile] = []) {
+    public init(ok: Bool = false, err: String? = nil, scale: Double? = nil,
+                tries: Int? = nil, tiles: [Tile] = []) {
         self.ok = ok
         self.err = err
+        self.scale = scale
+        self.tries = tries
         self.tiles = tiles
     }
 
     public var ratios: [Double] { tiles.compactMap(\.ratio) }
 
+    /// One row of the per-tile table: natural → measured → ratio.  `natural` and `ratio` are
+    /// absent when the tile had no taught base, which is a finding, not a zero.
     public struct Tile: Equatable, Decodable {
+        public var id: Int?
+        public var owner: String?
+        public var width: Double?
+        public var natural: Double?
         public var ratio: Double?
 
-        public init(ratio: Double? = nil) { self.ratio = ratio }
+        public init(id: Int? = nil, owner: String? = nil, width: Double? = nil,
+                    natural: Double? = nil, ratio: Double? = nil) {
+            self.id = id
+            self.owner = owner
+            self.width = width
+            self.natural = natural
+            self.ratio = ratio
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, owner, natural, ratio
+            case width = "w"
+        }
     }
 }
 
@@ -227,11 +341,14 @@ extension ResizeReport: Decodable {
         }
         ok = v(.ok, Bool.self) ?? false
         err = v(.err, String.self)
+        scale = v(.scale, Double.self)
+        tries = v(.tries, Int.self)
         tiles = v(.tiles, [Tile].self) ?? []
     }
 
     private enum Key: String, CodingKey {
-        case ok, err, tiles
+        case ok, err, tries, tiles
+        case scale = "s"
     }
 }
 

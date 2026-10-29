@@ -122,10 +122,11 @@ public enum Backend {
 
     private static func missingEntry(for command: SturgeonCommand) -> String {
         switch command {
-        case .status, .configWrite: return "install.py missing"
+        case .status, .counters, .configWrite: return "install.py missing"
         case .stages: return "stagepilot missing"
         case .rootProbe: return "asroot missing"
-        case .doctor, .configRead, .start, .stop, .resize, .move: return "wmship.sh missing"
+        case .doctor, .configRead, .start, .stop, .resize, .move, .moveWindow:
+            return "wmship.sh missing"
         }
     }
 
@@ -133,10 +134,23 @@ public enum Backend {
 
     public static func status() -> RunResult { run(.status) }
 
+    /// The keeper's full counter set, including `keep`, `learn`, `replay` and `dil` that
+    /// `status --json` does not carry.  Falls back to an empty report when the payload is
+    /// disarmed, which is a normal answer rather than an error.
+    public static func counters() -> CountersReport? {
+        run(.counters).decode(CountersReport.self)
+    }
+
     public static func doctor() -> RunResult { run(.doctor) }
 
     public static func stages() -> [StageItem] {
         StageItem.parse(run(.stages).out)
+    }
+
+    /// The stage list and the strip rect from the same call, so a drop hit-test uses frames read
+    /// at release time rather than a cache from the start of the drag.
+    public static func stageSnapshot() -> StageSnapshot {
+        StageSnapshot.parse(run(.stages).out)
     }
 
     public static func config() -> PayloadConfig? {
