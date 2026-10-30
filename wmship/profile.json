@@ -12,12 +12,13 @@
    "layout": {
     "WindowID": "isa, refcount|tag, serial@0x10, zero@0x18 (instanceSize 0x18)",
     "WindowIDTable": "_lock@0x10, _serial@0x18, _map@0x20, _externalRepresentations@0x28",
-    "map_value": "cgWindowID u32 @0, stageID u32 @4, owner String@8, title@0x18"
+    "map_value": "cgWindowID u32 @0, ownerPID u32 @4, owner String@8, title@0x18"
    },
    "evidence": [
     "widmeta 0x1005a3568: live isa of every WindowID object (round 30, 394 objects; round 31 verify: 125 objects / 117 table entries / 116 matched)",
     "widtable 0x1005a34b0: class metadata of _TtC18WindowManagerAgentP33_7469D0DA3FE97C4A7D1D958FF9AAA3C413WindowIDTable (round 30)",
-    "ivar_reg 0x1005b4640 / ivar_comp 0x1005b1e78: the two offset globals publish_rg reads; round 31 verify reads 0x4e0 / 0x42d0"
+    "ivar_reg 0x1005b4640 / ivar_comp 0x1005b1e78: the two offset globals publish_rg reads; round 31 verify reads 0x4e0 / 0x42d0",
+    "map value second u32 is the owner pid, not a stage (round 37: five entries matched the observer NEW lines)"
    ]
   }
  }
