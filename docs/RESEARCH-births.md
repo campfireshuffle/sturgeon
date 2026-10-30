@@ -123,3 +123,132 @@ sleep 1
 open -g -a TextEdit /tmp/birth.txt       # same-app birth, not activated
 tail -3 /tmp/wm/obs.log                  # NEW, then TILE at 48,708 96x117
 ```
+
+---
+
+## Round 37 addendum — the table's second field is a pid, and the component is not on the birth path
+
+Status: **still no behaviour change.** This addendum corrects one fact the section above relies on,
+records what the set-model component actually does during a same-app birth, and leaves the commit
+unpinned with a named next step. Instrumentation was live on the owner's machine; the transcript is
+below, including two WindowManager watchdog kills caused by the debugger (not by the payload).
+
+### 1. Correction: `WindowIDTable._map` carries the owner *process*, not the stage
+
+The section above says the map value is `{ cgWindowID, stageID }` and that "the newborn's entry
+appeared with the stage it was assigned (`cg=10061 ser=160 stage=37404`)". The second `u32` is the
+**owner pid**. Measured on build 462.0.8.402 by reading the live map and correlating it with the
+observer's `NEW` lines (`/tmp/wm/obs.log`, which prints the pid):
+
+| map entry | observer line |
+|---|---|
+| `key=124 cg=10124 pid=86236` | `NEW wid=10124 owner=TextEdit pid=86236` |
+| `key=93 cg=10169 pid=87707` | `NEW wid=10169 owner=Open and Save Panel Service pid=87707` |
+| `key=2 cg=9547 pid=94163` | `NEW wid=9547 owner=Orca pid=94163` |
+| `key=37 cg=9740 pid=17345` | `NEW wid=9740 owner=r20win pid=17345` |
+| `key=72 cg=8258 pid=1499` | Dia, `pgrep -x Dia` = 1499 |
+
+5 of 5 match, and the value's `String` at `+0x08` is the owner name (`profile.json` already says
+`owner String@8, title@0x18`). It follows that the earlier trial's `stage=37404` was TextEdit's
+**pid** — the same trial's observer line is `NEW wid=10061 owner=TextEdit pid=37404` — and
+`37450` was the pid TextEdit was relaunched under. The table is the WM's
+`WindowID serial → (cgWindowID, owner pid, owner, title)` index. It does not record a stage, so it
+cannot be read as evidence of "the set the WM assigned". `wmship/profile.json`'s
+`layout.map_value` and the comment above `publish_widcg()` still say `stageID`; this note is the
+correction until that data string is fixed.
+
+### 2. What the set-model component does during a same-app birth: nothing
+
+Class metadata `0x1005b4698` (this build), slide `0x4840000`. The vtable at `class+0x68` is 27
+entries; **slots 1–4 are the only resident methods** and slots 5–26 are
+`_swift_deletedMethodError`:
+
+| slot | file VA | what it is |
+|---|---|---|
+| 1 | `0x1002edf9c` | update, `void (InputModel)`, self in `x20`, input in `x0` |
+| 2 | `0x1002eea90` | model snapshot getter |
+| 3 | `0x1002ef9e8` | returns the 24-byte registry triple |
+| 4 | `0x1002efa38` | returns one 8-byte word |
+
+The four functions the earlier note counted as "8 WM-resident methods" (`0x1002f03e8/418/444/484`)
+are **protocol witness thunks** that forward to slots 3, 4, 1 and 2 respectively, with an indirect
+return buffer in `x8` (the 33-byte input copy at `0x1002f0444` is visible in the disassembly). They
+are not vtable slots.
+
+Eight breakpoints (the four methods plus the four thunks), each logging `x0…x4/x8/x20/lr/pc` and
+continuing, over a four-minute window on pid 11184 that included a TextEdit launch (11:43:53):
+
+```
+m1 0x1002edf9c  hits 0
+m2 0x1002eea90  hits 2   (11:47:30.204, 11:48:01.893)
+m3 0x1002ef9e8  hits 0
+m4 0x1002efa38  hits 0
+t5..t8          hits 0
+```
+
+Both m2 hits have `x20 = 0x7957745900` (the live component, the only one of six `isa` hits that
+validates), `x0 = 0x16b5a14f0 = self + 0x10` (the component's inline `inputModel`),
+`x8 = 0x42d0` (`StageManagerSpaceComponent.windowSetModelComponent`), `lr = 0x1002ae768`. They are
+**not birth hits**: the nearest `NEW` line in the observer log is 4.2 s before the first and 7.3 s
+after the second, and the two hits are 31.7 s apart — a periodic model read, not a window event.
+During the same window `StageManagerWindowSetModelComponent`'s update (slot 1, the only code that
+installs a registry) never ran.
+
+So the anchor this note proposed is not on the birth path on this build. The `(WindowID, set)` commit
+was **not** pinned.
+
+### 3. New: the WM's own registration *is* synchronous with a same-app birth
+
+The failure reproduced twice on this machine before any instrumentation, with the same signature as
+the section above (`open -g -a TextEdit` while TextEdit's stage was not current):
+
+```
+1793289264.185 NEW  wid=10209 owner=TextEdit pid=86236 on=0 0,0 0x0 name=r37birth1.txt
+1793289264.350 TILE wid=10209 owner=TextEdit dt=0.165 at 31,224 98x111
+1793289479.838 NEW  wid=10210 owner=TextEdit pid=86236 on=0 0,0 0x0 name=r37birth2.txt
+1793289479.866 TILE wid=10210 owner=TextEdit dt=0.030 at 48,224 96x111
+```
+
+`wmship/wmhb --verify` (task port, no debugger) before and after one same-app birth while TextEdit
+sat in a non-current stage:
+
+```
+before  {"objects":143,"serials":143,"map_entries":134,"map_matched":134}
+birth   open -g -a TextEdit /tmp/r37birth3.txt      -> TILE at 48,224 96x111
+after   {"objects":144,"serials":144,"map_entries":135,"map_matched":134}
+```
+
+Exactly one new `WindowID` object, one new serial and one new map entry per same-app birth, at the
+moment of the birth — while the user-side window list has not published the window yet
+(`map_matched` stays at 134). That is the event the driver hook never had.
+
+### 4. Where the next attempt should start
+
+The registration path is the only site measured to run exactly once per same-app birth:
+
+| item | value |
+|---|---|
+| serial bump + placeholder insert | `0x1001127d8` (increments `table+0x18`, copies the map at `table+0x20`, inserts a zeroed `(cg=0, pid=0, "", "")` value) |
+| its callers | `0x100290e10` (window-set model / space update) and `0x1003d89cc` (window ordering, the function that also takes the table lock at `0x1003d8e68`) |
+| table instance | global `0x1005a35e8`; class metadata `0x1005a34b0` |
+
+An attempt should hook `0x1001127d8` (or the ordering caller) **in the payload**, not in a debugger:
+one branch is cheap and in-line, and the payload already owns the control page. The open question
+that decides whether a fix is possible is still the same one: which code, after registration, chooses
+the set — and that is what a hook on `0x1001127d8` returning the caller is meant to answer.
+
+### 5. Instrumentation transcript (machine events)
+
+| time | event |
+|---|---|
+| 11:38 | lldb attached to pid 11184, slide `0x4840000`; vtable read; `isa` scan found the component |
+| 11:41 | eight breakpoints, each running a Python `hit()` that read six 256-byte buffers per hit |
+| 11:48:24 | **WindowManager 11184 died** — no crash report, i.e. the watchdog; lldb exited with it; launchd restarted it as 87619 |
+| 11:57 | pid 87619, slide `0x4a0000`; hardware watchpoint on `table+0x18`; a birth produced its tile in 28 ms and the watchpoint did not fire |
+| 12:05 | **WindowManager 87619 died** — again no crash report; restarted as 5976 |
+| 12:07 | final measurement used `wmhb --verify` only (no debugger) |
+
+Both kills are the debugger's stop time, not the payload's: the payload was never armed in this
+session. The previous watchdog kill in this project had the same cause. **Do not instrument this
+process with a command that reads memory on every hit, and do not set more than one stop of any
+kind at a time.**
